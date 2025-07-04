@@ -6,9 +6,7 @@ Collection of CUDA kernels I'm writing or have written for various purposes
 
 ```
 kernel-zoo/
-├── 🟢 base-ops/                        # Fundamental Operations
-│   ├── addvec/                     
-│   └── matvec/                       
+├── 🟢 base-ops/                        # Fundamental Operations                   
 ├── 🟡 fusion/                          # Kernel Fusions
 ├── 🔵 benchmarks/                      # Performance comparisons
 │   └── baseline/
