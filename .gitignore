@@ -1,0 +1,22 @@
+# CUDA compiled objects
+*.cubin
+*.ptx
+*.fatbin
+*.o
+*.so
+*.dll
+*.dylib
+
+# CUDA kernel cache
+*.cudacache
+*.cuda_cache
+
+# CUDA profiler output
+*.nvvp
+*.nvprof
+
+# CUDA debug files
+*.cudbg
+*.cudbg1
+*.cudbg2
+
