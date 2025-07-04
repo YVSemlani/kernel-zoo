@@ -20,3 +20,19 @@
 *.cudbg1
 *.cudbg2
 
+# Executable files with extensions
+*.exe
+*.out
+*.bin
+
+# Static and dynamic libraries
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Temporary and intermediate files
+*.tmp
+*.temp
+

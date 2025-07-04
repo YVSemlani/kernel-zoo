@@ -54,7 +54,7 @@ __global__ void naive_conv(
 
         // output shape
         int output_height,
-        int output_width,
+        int output_width
 
 ) {
 
