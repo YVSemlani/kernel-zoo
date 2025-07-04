@@ -75,8 +75,7 @@ __global__ void naive_conv(
     int input_x = bx * stride - padding;
     int input_y = by * stride - padding;
 
-    // get our starting index for the input tensor
-    int input_idx = bz * (in_channels * input_height * input_width) + input_y * (input_width) + input_x; // always start with the first input channel
+    int input_idx = bz * (in_channels * input_height * input_width); // we'll dynamically update this to hit the correct input channel
 
     // handle filter sizes over 1024 creating a for loop for the output index
     for (int filter_idx = tx; filter_idx < num_filters; filter_idx += 1024) {
@@ -100,7 +99,7 @@ __global__ void naive_conv(
                     }
 
                     // add the product of the input and kernel element directly to the output element
-                    dot_product += input[input_idx + C * (input_height * input_width) + H * (input_width) + W] * kernel[kernel_idx + C * (kernel_height * kernel_width) + H * (kernel_width) + W];
+                    dot_product += input[input_idx + C * (input_height * input_width) + (input_y + H) * (input_width) + (input_x + W)] * kernel[kernel_idx + C * (kernel_height * kernel_width) + H * (kernel_width) + W];
                 }
             }
         }
