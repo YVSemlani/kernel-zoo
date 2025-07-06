@@ -134,15 +134,39 @@ int main() {
         h_kernel[i] = rand() / (float)RAND_MAX;
     }
 
+    // set up timing variables
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float ms = 0.0f;
+
+    // start timing
+    cudaEventRecord(start);
+
     // allocate device memory for the input, kernel, and output tensors
     float *d_input, *d_kernel, *d_output;
     cudaMalloc(&d_input, size_input);
     cudaMalloc(&d_kernel, size_kernel);
     cudaMalloc(&d_output, size_output);
 
+    // stop timing
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    printf(">> GPU allocation time: %f ms\n", ms);
+
+    // start timing
+    cudaEventRecord(start);
+
     // copy host arrays to device
     cudaMemcpy(d_input, h_input, size_input, cudaMemcpyHostToDevice);
     cudaMemcpy(d_kernel, h_kernel, size_kernel, cudaMemcpyHostToDevice);
+
+    // stop timing
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    printf(">> Host to device transfer time: %f ms\n", ms);
 
     // define grid and block dimensions
     dim3 gridDim(OUTPUT_WIDTH, OUTPUT_HEIGHT, BATCH_DIM);
@@ -154,6 +178,27 @@ int main() {
     } else {
         BLOCK_SIZE = NUM_FILTERS;
     }
+
+    // start timing
+    cudaEventRecord(start);
+
+    // warm up
+    for (int i = 0; i < 10; i++) {
+        naive_conv<<<gridDim, BLOCK_SIZE>>>(d_input, d_kernel, d_output, 
+            BATCH_DIM, IN_CHANNELS, INPUT_HEIGHT, INPUT_WIDTH, 
+            NUM_FILTERS, KERNEL_HEIGHT, KERNEL_WIDTH, 
+            STRIDE, PADDING, 
+            OUTPUT_HEIGHT, OUTPUT_WIDTH);
+    }
+
+    // stop timing
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    printf(">> Warm up time: %f ms\n", ms);
+
+    // start timing
+    cudaEventRecord(start);
 	
 	// run the vector addition kernel
     naive_conv<<<gridDim, BLOCK_SIZE>>>(d_input, d_kernel, d_output, 
@@ -161,11 +206,26 @@ int main() {
         NUM_FILTERS, KERNEL_HEIGHT, KERNEL_WIDTH, 
         STRIDE, PADDING, 
         OUTPUT_HEIGHT, OUTPUT_WIDTH);
+
+    // stop timing
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    printf(">> Kernel execution time: %f ms\n", ms);
+
+    // start timing
+    cudaEventRecord(start);
 	
 	// copy device array back to the host
 	// only C because A and B are the same
 	
 	cudaMemcpy(h_output, d_output, size_output, cudaMemcpyDeviceToHost);
+
+    // stop timing
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    printf(">> Device to host transfer time: %f ms\n", ms);
 
     // Free device memory
     cudaFree(d_input);
