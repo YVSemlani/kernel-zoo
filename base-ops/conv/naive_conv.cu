@@ -22,8 +22,8 @@
 
 #define BATCH_DIM 1
 #define IN_CHANNELS 3
-#define INPUT_HEIGHT 224
-#define INPUT_WIDTH 224
+#define INPUT_HEIGHT 1024
+#define INPUT_WIDTH 1024
 #define NUM_FILTERS 64
 #define KERNEL_HEIGHT 3
 #define KERNEL_WIDTH 3

@@ -13,6 +13,10 @@ def run_benchmark(n_iters, conv_params):
     # initialize conv kernel
     conv = nn.Conv2d(conv_params["in_channels"], conv_params["out_channels"], conv_params["kernel_size"], conv_params["stride"], conv_params["padding"])
 
+    # put conv kernel on gpu
+    conv.to("cuda")
+    input_tensor = input_tensor.to("cuda")
+
     # warm up convolution
     for _ in range(10):
         _ = conv(input_tensor)
@@ -30,7 +34,7 @@ def run_benchmark(n_iters, conv_params):
         # Measure time
         torch.cuda.synchronize()  # Ensure all CUDA operations are finished
         start = time.time()
-        _ = conv(input_tensor, dim=-1)
+        _ = conv(input_tensor)
         torch.cuda.synchronize()  # Synchronize again
         end = time.time()
         
@@ -41,4 +45,4 @@ def run_benchmark(n_iters, conv_params):
     print(f"Times: {times}")
 
 if __name__ == "__main__":
-    run_benchmark(5, {"batch_size": 1, "in_channels": 3, "input_height": 224, "input_width": 224, "out_channels": 3, "kernel_size": (3, 3), "stride": 1, "padding": 1})
+    run_benchmark(5, {"batch_size": 1, "in_channels": 3, "input_height": 1024, "input_width": 1024, "out_channels": 64, "kernel_size": (3, 3), "stride": 1, "padding": 1})
