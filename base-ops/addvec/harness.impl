@@ -1,0 +1,95 @@
+#include <iostream>
+#include <string>
+#include <fstream>
+
+#define N 10000000 // vector size 10M
+
+#define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
+inline void __cudaCheckError( const char *file, const int line ) {
+    cudaError err = cudaGetLastError();
+    if ( cudaSuccess != err ) {
+        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n", file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+    err = cudaDeviceSynchronize();
+    if( cudaSuccess != err ) {
+        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n", file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+}
+
+int main(int argc, char **argv) {
+    // create dummy variables that are the right size
+    constexpr int TOTAL_ELEMENTS = N;
+    float *a     = new float[TOTAL_ELEMENTS];
+    float *b     = new float[TOTAL_ELEMENTS];
+    float *c     = new float[TOTAL_ELEMENTS];
+    float *c_ref = new float[TOTAL_ELEMENTS];
+
+    if(argc > 1) {
+        std::ifstream infile(argv[1]);
+        for(int i = 0; i < TOTAL_ELEMENTS; i++) {   infile >> a[i];    }
+        for(int i = 0; i < TOTAL_ELEMENTS; i++) {   infile >> b[i];    }
+        for(int i = 0; i < TOTAL_ELEMENTS; i++) {   infile >> c_ref[i];  }
+        std::cout << "Finished loading file from " << argv[1] << "!" << std::endl;
+    } else {
+        // Initialize with test data if no file provided
+        for(int i = 0; i < TOTAL_ELEMENTS; i++) {
+            a[i] = i * 1.0f;
+            b[i] = i * 2.0f;
+            c_ref[i] = a[i] + b[i]; // expected result
+        }
+        std::cout << "Using default test data!" << std::endl;
+    }
+
+    // set the inputs
+    float *d_a, *d_b, *d_c;
+    cudaMalloc(&d_a, TOTAL_ELEMENTS * sizeof(float));
+    cudaMalloc(&d_b, TOTAL_ELEMENTS * sizeof(float));
+    cudaMalloc(&d_c, TOTAL_ELEMENTS * sizeof(float));
+    cudaMemcpy(d_a, a, TOTAL_ELEMENTS * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, b, TOTAL_ELEMENTS * sizeof(float), cudaMemcpyHostToDevice);
+
+    std::cout << "Starting kernel\n";
+    cudaDeviceSynchronize();
+    CudaCheckError();
+    dispatch_micro( d_a, d_b, d_c ); 
+    cudaDeviceSynchronize();
+    CudaCheckError();
+    std::cout << "Finished kernel\n";
+    
+    // check correctness
+    cudaMemcpy(c, d_c, TOTAL_ELEMENTS * sizeof(float), cudaMemcpyDeviceToHost);
+    bool good = true;
+    std::ofstream c_ref_file("printouts/c_ref.txt");
+    std::ofstream c_file("printouts/c.txt");
+    std::ofstream diff_file("printouts/diff.txt");
+    std::cout << "Total elements: " << TOTAL_ELEMENTS << std::endl;
+    for(int i = 0; i < TOTAL_ELEMENTS; i++) {
+        float diff = c[i] - c_ref[i];
+        if(i < TOTAL_ELEMENTS) {
+            c_ref_file << c_ref[i] << ' ';
+            c_file << c[i] << ' ';
+            diff_file << diff << ' ';
+            if (i % 16 == 15) {
+                c_ref_file << std::endl;
+                c_file << std::endl;
+                diff_file << std::endl;
+            }
+        }
+        if(abs(diff) > 0.1 || isnan(diff)) {
+            if (good == true) { 
+                printf("i: %d, pred: %f, ref: %f, diff: %f\n", i, c[i], c_ref[i], diff);
+            }
+            good = false;
+        }
+    }
+    if(good) std::cout << "Correct out :)\n";
+    else std::cout << "Incorrect out :(\n";
+
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+    delete[] a, b, c, c_ref;
+    return 0;
+}
