@@ -6,6 +6,20 @@ using namespace kittens;
 
 #define N 10000000 // vector size 10M
 
+// convolution parameters
+
+#define BATCH_DIM 1
+#define IN_CHANNELS 3
+#define INPUT_HEIGHT 1024
+#define INPUT_WIDTH 1024
+#define NUM_FILTERS 64
+#define KERNEL_HEIGHT 3
+#define KERNEL_WIDTH 3
+#define STRIDE 1
+#define PADDING 1
+#define OUTPUT_HEIGHT ((INPUT_HEIGHT + 2 * PADDING - KERNEL_HEIGHT) / STRIDE + 1)
+#define OUTPUT_WIDTH ((INPUT_WIDTH + 2 * PADDING - KERNEL_WIDTH) / STRIDE + 1)
+
 // define tile sizes
 #define _row 16
 #define _col 16
@@ -14,7 +28,7 @@ using namespace kittens;
 // this makes it easier for us to use optimal 16x16 tile sizes
 
 struct important_layouts {
-    using _gl = gl<float, -1, -1, -1, -1, st_fl<16, 16>>; // global layout for A, B, C
+    using _gl = gl<float, -1, -1, -1, -1, st_fl<_row, _col>>; // global layout for input, kernel, output
     _gl a, b, c;
 };
 

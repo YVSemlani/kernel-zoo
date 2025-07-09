@@ -17,9 +17,6 @@
 // computes dot product of kernel and relevant portion of the input
 // insert to relevant element of the output tensor
 
-// works up to 1024 filters and no other constraints on shape
-
-
 #define BATCH_DIM 1
 #define IN_CHANNELS 3
 #define INPUT_HEIGHT 1024
