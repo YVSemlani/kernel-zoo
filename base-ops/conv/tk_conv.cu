@@ -79,8 +79,8 @@ void tk_conv(const __grid_constant__ conv_globals g) {
 
     // identify the starting x and y coordinates of the input tile
     // will be negative when we're in a padding region
-    int input_start_x = output_col * _col * STRIDE - PADDING;
-    int input_start_y = output_row * _row * STRIDE - PADDING;
+    int input_start_x = output_col * OUTPUT_TILE_WIDTH * STRIDE - PADDING;
+    int input_start_y = output_row * OUTPUT_TILE_HEIGHT * STRIDE - PADDING;
 
     // load the kernel into shared memory
     // the kernel stays constant across all input channels
@@ -128,7 +128,7 @@ void tk_conv(const __grid_constant__ conv_globals g) {
         }
 
         // load the kernel for this input channel into a register
-        rt_fl<KERNEL_HEIGHT, KERNEL_WIDTH> kernel_reg;
+        rt_fl<KERNEL_HEIGHT *KERNEL_WIDTH> kernel_reg;
         load(kernel_reg, kernel_s[c]);
         /*
             CONVOLUTION
@@ -150,7 +150,7 @@ void tk_conv(const __grid_constant__ conv_globals g) {
                 // flatten and load the subtile into im2col matrix
                 for (int kh = 0; kh < KERNEL_HEIGHT; kh++) {
                     for (int kw = 0; kw < KERNEL_WIDTH; kw++) {
-                        im2col_s[k * KERNEL_HEIGHT + kw][ih * (INPUT_TILE_WIDTH - KERNEL_WIDTH + 1)+ iw] = input_subtile[kh][kw];
+                        im2col_s[kh * KERNEL_HEIGHT + kw][ih * (INPUT_TILE_WIDTH - KERNEL_WIDTH + 1)+ iw] = input_subtile[kh][kw];
                     }
                 }
             }
