@@ -31,7 +31,7 @@ we can then do matrix multiplication at our desired size?
 
 kernel shape is initially num_filter x in_channels x kernel_height x kernel_width
 but the seperated dimensions make it so that we can't load in 16x16 tiles of the kernel matrix
-so we combine 
+so we combine the input chanenls and kernel dimensions into a single dimension and keep the number of filter (assuming larger than 16)
 
 */
 
@@ -52,7 +52,7 @@ void tk_conv(const __grid_constant__ conv_globals g) {
     extern __shared__ alignment_dummy __shm[]; // allocates a dynamic amount of shared memory
     shared_allocator al((int*)&__shm[0]); // create a shared memory allocator and point it to the starting address of the shared memory
     st_fl<80, 80> (&input_s) = al.allocate<st_fl<80, 80>>(); // allocate memory for an 80x80 tile of the input matrix
-    st_fl<IN_CHANNELS, KERNEL_HEIGHT * KERNEL_WIDTH> (&kernel_s) = al.allocate<st_fl<IN_CHANNELS, KERNEL_HEIGHT * KERNEL_WIDTH>>(); // allocate memory for a 3x25 tile of the kernel matrix
+    st_fl<16, IN_CHANNELS * KERNEL_HEIGHT * KERNEL_WIDTH> (&kernel_s) = al.allocate<st_fl<16, IN_CHANNELS * KERNEL_HEIGHT * KERNEL_WIDTH>>(); // load in 16 filters at a time
     st_fl<16, 16> (&output_s) = al.allocate<st_fl<16, 16>>(); // allocate memory for a 16x16 tile of the output matrix
 
     // load from HBM to shared
