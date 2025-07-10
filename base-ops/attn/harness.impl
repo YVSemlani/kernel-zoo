@@ -1,0 +1,339 @@
+#include <iostream>
+#include <random>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <vector>
+#include <iomanip>
+
+#define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
+inline void __cudaCheckError( const char *file, const int line ) {
+    cudaError err = cudaGetLastError();
+    if ( cudaSuccess != err ) {
+        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n", file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+    err = cudaDeviceSynchronize();
+    if( cudaSuccess != err ) {
+        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n", file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+}
+
+// CPU attention implementation (no softmax, no scaling)
+void cpu_attention(
+    const float* Q,      // [batch, seq_len, head_dim]
+    const float* K,      // [batch, seq_len, head_dim] 
+    const float* V,      // [batch, seq_len, head_dim]
+    float* output,       // [batch, seq_len, head_dim]
+    int batch_dim, int seq_len, int head_dim
+) {
+    // Initialize output to zero
+    int output_size = batch_dim * seq_len * head_dim;
+    std::fill(output, output + output_size, 0.0f);
+    
+    for (int b = 0; b < batch_dim; b++) {
+        for (int i = 0; i < seq_len; i++) {
+            for (int d = 0; d < head_dim; d++) {
+                float sum = 0.0f;
+                
+                // Compute (Q @ K^T @ V)[i,d] = sum_j (Q[i,:] @ K[j,:]) * V[j,d]
+                for (int j = 0; j < seq_len; j++) {
+                    // Compute attention weight: Q[i,:] @ K[j,:]
+                    float attn_weight = 0.0f;
+                    for (int k = 0; k < head_dim; k++) {
+                        int q_idx = b * (seq_len * head_dim) + i * head_dim + k;
+                        int k_idx = b * (seq_len * head_dim) + j * head_dim + k;
+                        attn_weight += Q[q_idx] * K[k_idx];
+                    }
+                    
+                    // Multiply by V[j,d] and accumulate
+                    int v_idx = b * (seq_len * head_dim) + j * head_dim + d;
+                    sum += attn_weight * V[v_idx];
+                }
+                
+                int out_idx = b * (seq_len * head_dim) + i * head_dim + d;
+                output[out_idx] = sum;
+            }
+        }
+    }
+}
+
+// Function to generate random data
+void generate_random_data(float* data, int size, float min_val = -0.1f, float max_val = 0.1f) {
+    std::random_device rd;
+    std::mt19937 gen(42); // Fixed seed for reproducibility
+    std::uniform_real_distribution<float> dis(min_val, max_val);
+    
+    for (int i = 0; i < size; i++) {
+        data[i] = dis(gen);
+    }
+}
+
+// Function to analyze differences by regions/tiles
+void analyze_regions(const float* cpu_result, const float* gpu_result, int batch_dim, int seq_len, int head_dim, float tolerance = 1e-2f) {
+    printf("\n=== REGION-WISE MISMATCH ANALYSIS ===\n");
+    
+    // Tile dimensions from the kernel
+    const int TILE_SIZE = 16;
+    const int SEQ_TILES = seq_len / TILE_SIZE; // 8 tiles (128/16)
+    const int HEAD_TILES = head_dim / TILE_SIZE; // 16 tiles (256/16)
+    
+    printf("Analyzing %dx%d tiles (%d sequence tiles x %d head dimension tiles)\n", 
+           SEQ_TILES, HEAD_TILES, SEQ_TILES, HEAD_TILES);
+    printf("Each tile is %dx%d elements\n\n", TILE_SIZE, TILE_SIZE);
+    
+    struct TileStats {
+        int tile_row, tile_col;
+        float max_diff;
+        float avg_diff;
+        int error_count;
+        int total_elements;
+    };
+    
+    std::vector<TileStats> tile_stats;
+    
+    // Analyze each tile
+    for (int tile_row = 0; tile_row < SEQ_TILES; tile_row++) {
+        for (int tile_col = 0; tile_col < HEAD_TILES; tile_col++) {
+            TileStats stats = {tile_row, tile_col, 0.0f, 0.0f, 0, TILE_SIZE * TILE_SIZE};
+            float sum_diff = 0.0f;
+            
+            // Check each element in the tile
+            for (int i = 0; i < TILE_SIZE; i++) {
+                for (int j = 0; j < TILE_SIZE; j++) {
+                    int seq_idx = tile_row * TILE_SIZE + i;
+                    int head_idx = tile_col * TILE_SIZE + j;
+                    
+                    if (seq_idx < seq_len && head_idx < head_dim) {
+                        int global_idx = seq_idx * head_dim + head_idx;
+                        float diff = std::abs(cpu_result[global_idx] - gpu_result[global_idx]);
+                        
+                        stats.max_diff = std::max(stats.max_diff, diff);
+                        sum_diff += diff;
+                        
+                        if (diff > tolerance) {
+                            stats.error_count++;
+                        }
+                    }
+                }
+            }
+            
+            stats.avg_diff = sum_diff / stats.total_elements;
+            tile_stats.push_back(stats);
+        }
+    }
+    
+    // Sort tiles by max difference to identify worst offenders
+    std::sort(tile_stats.begin(), tile_stats.end(), 
+              [](const TileStats& a, const TileStats& b) { return a.max_diff > b.max_diff; });
+    
+    printf("TOP 10 WORST TILES (by max difference):\n");
+    printf("%-8s %-8s %-12s %-12s %-12s %-8s\n", 
+           "Tile", "Tile", "Max Diff", "Avg Diff", "Error", "Error");
+    printf("%-8s %-8s %-12s %-12s %-12s %-8s\n", 
+           "Row", "Col", "", "", "Count", "Rate");
+    printf("%-8s %-8s %-12s %-12s %-12s %-8s\n", 
+           "----", "----", "--------", "--------", "-----", "----");
+    
+    for (int i = 0; i < std::min(10, (int)tile_stats.size()); i++) {
+        const auto& stats = tile_stats[i];
+        float error_rate = (float)stats.error_count / stats.total_elements * 100.0f;
+        printf("%-8d %-8d %-12.6f %-12.6f %-12d %-7.1f%%\n",
+               stats.tile_row, stats.tile_col, stats.max_diff, stats.avg_diff, 
+               stats.error_count, error_rate);
+    }
+    
+    // Create a visual heatmap of error regions
+    printf("\nERROR HEATMAP (max difference per tile):\n");
+    printf("Rows = sequence tiles (0-%d), Cols = head dimension tiles (0-%d)\n", SEQ_TILES-1, HEAD_TILES-1);
+    printf("Legend: '.' = <0.01, '+' = 0.01-0.1, '*' = 0.1-0.5, '#' = >0.5\n\n");
+    
+    // Create 2D grid for visualization
+    std::vector<std::vector<float>> error_grid(SEQ_TILES, std::vector<float>(HEAD_TILES, 0.0f));
+    for (const auto& stats : tile_stats) {
+        error_grid[stats.tile_row][stats.tile_col] = stats.max_diff;
+    }
+    
+    // Print column headers
+    printf("    ");
+    for (int col = 0; col < HEAD_TILES; col++) {
+        printf("%2d", col % 10);
+    }
+    printf("\n");
+    
+    // Print heatmap
+    for (int row = 0; row < SEQ_TILES; row++) {
+        printf("%2d: ", row);
+        for (int col = 0; col < HEAD_TILES; col++) {
+            float diff = error_grid[row][col];
+            char symbol;
+            if (diff < 0.01f) symbol = '.';
+            else if (diff < 0.1f) symbol = '+';
+            else if (diff < 0.5f) symbol = '*';
+            else symbol = '#';
+            printf("%c ", symbol);
+        }
+        printf("\n");
+    }
+    
+    // Statistics summary
+    int total_error_tiles = 0;
+    float total_max_diff = 0.0f;
+    for (const auto& stats : tile_stats) {
+        if (stats.error_count > 0) total_error_tiles++;
+        total_max_diff = std::max(total_max_diff, stats.max_diff);
+    }
+    
+    printf("\nSUMMARY:\n");
+    printf("Total tiles: %d\n", (int)tile_stats.size());
+    printf("Tiles with errors: %d (%.1f%%)\n", total_error_tiles, 
+           (float)total_error_tiles / tile_stats.size() * 100.0f);
+    printf("Overall max difference: %.6f\n", total_max_diff);
+    
+    // Identify patterns
+    printf("\nPATTERN ANALYSIS:\n");
+    bool first_row_errors = false, last_row_errors = false;
+    bool first_col_errors = false, last_col_errors = false;
+    
+    for (const auto& stats : tile_stats) {
+        if (stats.error_count > 0) {
+            if (stats.tile_row == 0) first_row_errors = true;
+            if (stats.tile_row == SEQ_TILES - 1) last_row_errors = true;
+            if (stats.tile_col == 0) first_col_errors = true;
+            if (stats.tile_col == HEAD_TILES - 1) last_col_errors = true;
+        }
+    }
+    
+    if (first_row_errors) printf("- Errors detected in first sequence tile row\n");
+    if (last_row_errors) printf("- Errors detected in last sequence tile row\n");
+    if (first_col_errors) printf("- Errors detected in first head dimension tile column\n");
+    if (last_col_errors) printf("- Errors detected in last head dimension tile column\n");
+    
+    if (!first_row_errors && !last_row_errors && !first_col_errors && !last_col_errors) {
+        printf("- No obvious boundary effects detected\n");
+    }
+}
+
+// Function to compare two arrays with enhanced region analysis
+bool compare_results(const float* a, const float* b, int size, float tolerance = 1e-2f) {
+    float max_diff = 0.0f;
+    int diff_count = 0;
+    
+    for (int i = 0; i < size; i++) {
+        float diff = std::abs(a[i] - b[i]);
+        max_diff = std::max(max_diff, diff);
+        
+        if (diff > tolerance) {
+            diff_count++;
+            if (diff_count <= 10) { // Print first 10 differences
+                printf("Diff at index %d: CPU=%.6f, GPU=%.6f, diff=%.6f\n", 
+                       i, a[i], b[i], diff);
+            }
+        }
+    }
+    
+    printf("Max difference: %.6f\n", max_diff);
+    printf("Number of differences > %.6f: %d/%d\n", tolerance, diff_count, size);
+    
+    // Add region analysis if there are differences
+    if (diff_count > 0) {
+        analyze_regions(a, b, BATCH_DIM, SEQ_LEN, HEAD_DIM, tolerance);
+    }
+    
+    return diff_count == 0;
+}
+
+int main() {
+    printf("=== Attention Kernel Test ===\n");
+    printf("Parameters:\n");
+    printf("  Batch: %d\n", BATCH_DIM);
+    printf("  Sequence length: %d\n", SEQ_LEN);
+    printf("  Head dimension: %d\n", HEAD_DIM);
+    printf("  Operation: Q @ K^T @ V (no softmax, no scaling)\n\n");
+    
+    // Calculate array sizes
+    int qkv_size = BATCH_DIM * SEQ_LEN * HEAD_DIM;
+    int output_size = BATCH_DIM * SEQ_LEN * HEAD_DIM;
+    
+    printf("Array sizes:\n");
+    printf("  Q, K, V: %d elements each (%.2f MB each)\n", qkv_size, qkv_size * sizeof(float) / (1024.0f * 1024.0f));
+    printf("  Output: %d elements (%.2f MB)\n\n", output_size, output_size * sizeof(float) / (1024.0f * 1024.0f));
+    
+    // Allocate host memory
+    float* h_Q = new float[qkv_size];
+    float* h_K = new float[qkv_size];
+    float* h_V = new float[qkv_size];
+    float* h_output_cpu = new float[output_size];
+    float* h_output_gpu = new float[output_size];
+    
+    // Allocate device memory
+    float *d_Q, *d_K, *d_V, *d_output;
+    cudaMalloc(&d_Q, qkv_size * sizeof(float));
+    cudaMalloc(&d_K, qkv_size * sizeof(float));
+    cudaMalloc(&d_V, qkv_size * sizeof(float));
+    cudaMalloc(&d_output, output_size * sizeof(float));
+    
+    // Generate random data
+    printf("Generating random data...\n");
+    generate_random_data(h_Q, qkv_size);
+    generate_random_data(h_K, qkv_size);
+    generate_random_data(h_V, qkv_size);
+    
+    // Copy data to device
+    printf("Copying data to GPU...\n");
+    cudaMemcpy(d_Q, h_Q, qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K, qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V, qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, output_size * sizeof(float));
+    
+    // Run CPU attention
+    printf("Running CPU attention...\n");
+    auto start_cpu = std::chrono::high_resolution_clock::now();
+    cpu_attention(h_Q, h_K, h_V, h_output_cpu, BATCH_DIM, SEQ_LEN, HEAD_DIM);
+    auto end_cpu = std::chrono::high_resolution_clock::now();
+    auto cpu_time = std::chrono::duration<double, std::milli>(end_cpu - start_cpu).count();
+    printf("CPU attention completed in %.2f ms\n\n", cpu_time);
+    
+    // Run GPU kernel
+    printf("Running GPU kernel...\n");
+    auto start_gpu = std::chrono::high_resolution_clock::now();
+    dispatch_micro(d_Q, d_K, d_V, d_output);
+    CudaCheckError();
+    auto end_gpu = std::chrono::high_resolution_clock::now();
+    auto gpu_time = std::chrono::duration<double, std::milli>(end_gpu - start_gpu).count();
+    printf("GPU kernel completed in %.2f ms\n", gpu_time);
+    printf("Speedup: %.2fx\n\n", cpu_time / gpu_time);
+    
+    // Copy result back from device
+    cudaMemcpy(h_output_gpu, d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Compare results
+    printf("Comparing results...\n");
+    bool results_match = compare_results(h_output_cpu, h_output_gpu, output_size, 1e-1f);
+    
+    if (results_match) {
+        printf("✅ SUCCESS: CPU and GPU results match!\n");
+    } else {
+        printf("❌ FAILURE: CPU and GPU results differ!\n");
+        
+        // Print some sample values for debugging
+        printf("\nSample comparisons (first 10 values):\n");
+        for (int i = 0; i < std::min(10, output_size); i++) {
+            printf("  [%d]: CPU=%.6f, GPU=%.6f\n", i, h_output_cpu[i], h_output_gpu[i]);
+        }
+    }
+    
+    // Cleanup
+    delete[] h_Q;
+    delete[] h_K;
+    delete[] h_V;
+    delete[] h_output_cpu;
+    delete[] h_output_gpu;
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_output);
+    
+    return results_match ? 0 : 1;
+} 
