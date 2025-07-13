@@ -6,48 +6,75 @@
   cudaError_t err = x; \
   if (err != cudaSuccess) { \
     std::cerr << "CUDA error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-    return 1; \
+    exit(1); \
   } \
 } while (0)
 
-int main() { \
-    using bf16 = __nv_bfloat16; \
-    constexpr int BATCH = 1; \
-    constexpr int SEQ = 128; \
-    constexpr int HEAD = 1024; \
-    constexpr int TOTAL_X = BATCH * SEQ * HEAD; \
-    constexpr int TOTAL_P = BATCH * SEQ; \
-    bf16 *h_x = new bf16[TOTAL_X]; \
-    bf16 *h_w_q = new bf16[TOTAL_X]; \
-    bf16 *h_w_k = new bf16[TOTAL_X]; \
-    bf16 *h_p = new bf16[TOTAL_P]; \
-    bf16 *h_b = new bf16[TOTAL_P]; \
-    for(int i=0; i<TOTAL_X; i++) { \
-        float val = (static_cast<float>(rand()) / RAND_MAX) * 2.0f - 1.0f; \
-        h_x[i] = bf16(val); \
-        h_w_q[i] = bf16(val); \
-        h_w_k[i] = bf16(val); \
-    } \
-    float *d_x, *d_w_q, *d_w_k, *d_p, *d_b; \
-    CUDA_CHECK(cudaMalloc(&d_x, TOTAL_X * sizeof(bf16))); \
-    CUDA_CHECK(cudaMalloc(&d_w_q, TOTAL_X * sizeof(bf16))); \
-    CUDA_CHECK(cudaMalloc(&d_w_k, TOTAL_X * sizeof(bf16))); \
-    CUDA_CHECK(cudaMalloc(&d_p, TOTAL_P * sizeof(bf16))); \
-    CUDA_CHECK(cudaMalloc(&d_b, TOTAL_P * sizeof(bf16))); \
-    CUDA_CHECK(cudaMemcpy(d_x, h_x, TOTAL_X * sizeof(bf16), cudaMemcpyHostToDevice)); \
-    CUDA_CHECK(cudaMemcpy(d_w_q, h_w_q, TOTAL_X * sizeof(bf16), cudaMemcpyHostToDevice)); \
-    CUDA_CHECK(cudaMemcpy(d_w_k, h_w_k, TOTAL_X * sizeof(bf16), cudaMemcpyHostToDevice)); \
-    std::cout << "Launching kernel" << std::endl; \
-    dispatch_micro(d_x, d_w_q, d_w_k, d_p, d_b); \
-    CUDA_CHECK(cudaGetLastError()); \
-    CUDA_CHECK(cudaDeviceSynchronize()); \
-    std::cout << "Kernel finished" << std::endl; \
-    CUDA_CHECK(cudaMemcpy(h_p, d_p, TOTAL_P * sizeof(bf16), cudaMemcpyDeviceToHost)); \
-    CUDA_CHECK(cudaMemcpy(h_b, d_b, TOTAL_P * sizeof(bf16), cudaMemcpyDeviceToHost)); \
-    for(int i=0; i<10; i++) { \
-        std::cout << "p[" << i << "] = " << __bfloat162float(h_p[i]) << ", b[" << i << "] = " << __bfloat162float(h_b[i]) << std::endl; \
-    } \
-    delete[] h_x; delete[] h_w_q; delete[] h_w_k; delete[] h_p; delete[] h_b; \
-    cudaFree(d_x); cudaFree(d_w_q); cudaFree(d_w_k); cudaFree(d_p); cudaFree(d_b); \
-    return 0; \
-} 
+// Forward declaration for dispatch_micro
+void dispatch_micro(float* d_x, float* d_W_q, float* d_W_k, float* d_p, float* d_b);
+
+int main() {
+    using bf16 = __nv_bfloat16;
+    constexpr int BATCH = 1;
+    constexpr int SEQ = 128;
+    constexpr int HEAD = 1024;
+    constexpr int TOTAL_X = BATCH * SEQ * HEAD;
+    constexpr int TOTAL_P = BATCH * SEQ;
+
+    // Host allocations
+    bf16* h_x   = new bf16[TOTAL_X];
+    bf16* h_w_q = new bf16[TOTAL_X];
+    bf16* h_w_k = new bf16[TOTAL_X];
+    bf16* h_p   = new bf16[TOTAL_P];
+    bf16* h_b   = new bf16[TOTAL_P];
+
+    // Initialize host data
+    for (int i = 0; i < TOTAL_X; i++) {
+        float val = (static_cast<float>(rand()) / RAND_MAX) * 2.0f - 1.0f;
+        h_x[i]   = bf16(val);
+        h_w_q[i] = bf16(val);
+        h_w_k[i] = bf16(val);
+    }
+
+    // Device allocations
+    bf16 *d_x = nullptr, *d_w_q = nullptr, *d_w_k = nullptr, *d_p = nullptr, *d_b = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_x,   TOTAL_X * sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&d_w_q, TOTAL_X * sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&d_w_k, TOTAL_X * sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&d_p,   TOTAL_P * sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&d_b,   TOTAL_P * sizeof(bf16)));
+
+    // Copy host to device
+    CUDA_CHECK(cudaMemcpy(d_x,   h_x,   TOTAL_X * sizeof(bf16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w_q, h_w_q, TOTAL_X * sizeof(bf16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w_k, h_w_k, TOTAL_X * sizeof(bf16), cudaMemcpyHostToDevice));
+
+    std::cout << "Launching kernel" << std::endl;
+    dispatch_micro(reinterpret_cast<float*>(d_x), reinterpret_cast<float*>(d_w_q), reinterpret_cast<float*>(d_w_k), reinterpret_cast<float*>(d_p), reinterpret_cast<float*>(d_b));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::cout << "Kernel finished" << std::endl;
+
+    // Copy device to host
+    CUDA_CHECK(cudaMemcpy(h_p, d_p, TOTAL_P * sizeof(bf16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_b, d_b, TOTAL_P * sizeof(bf16), cudaMemcpyDeviceToHost));
+
+    for (int i = 0; i < 10; i++) {
+        std::cout << "p[" << i << "] = " << __bfloat162float(h_p[i])
+                  << ", b[" << i << "] = " << __bfloat162float(h_b[i]) << std::endl;
+    }
+
+    // Cleanup
+    delete[] h_x;
+    delete[] h_w_q;
+    delete[] h_w_k;
+    delete[] h_p;
+    delete[] h_b;
+    cudaFree(d_x);
+    cudaFree(d_w_q);
+    cudaFree(d_w_k);
+    cudaFree(d_p);
+    cudaFree(d_b);
+
+    return 0;
+}

@@ -34,7 +34,41 @@ struct dc_globals {
     weights_gl W_q, W_k;
     p_gl p;
     b_gl b;
-}
+};
+
+// Sqrt operation for bfloat16
+struct sqrt_op {
+    template<typename T> __device__ static inline T op(const T &a) {
+        if constexpr (std::is_same_v<T, bf16>) {
+            // Convert to float, apply sqrt, convert back
+            float f = __bfloat162float(a);
+            return __float2bfloat16(sqrtf(f));
+        } else {
+            return sqrtf(a);
+        }
+    }
+};
+
+// B_t operation for bfloat16
+struct b_t_op {
+    template<typename T> __device__ static inline T op(const T &a) {
+        if constexpr (std::is_same_v<T, bf16>) {
+            // Convert to float, apply b_t, convert back
+            float f = __bfloat162float(a);
+            if (f > 0.5f) {
+                return bf16(1.0f);
+            } else {
+                return bf16(0.0f);
+            }
+        } else {
+            if (a > 0.5f) {
+                return 1.0f;
+            } else {
+                return 0.0f;
+            }
+        }
+    }
+};
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void tk_dc(const __grid_constant__ dc_globals g) {
@@ -51,23 +85,24 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     // setup shared memory space for Q and K blocks
     st_bf<16, 16> (&W_q_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of W_q
     st_bf<16, 16> (&W_k_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of W_k
+    st_bf<16, 16> (&x_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of x
 
     // load the x and weights from HBM to shared
-    load(g.x, g.x, {0, 0, byte_id, 0});
+    load(x_s, g.x, {0, 0, byte_id, 0}); // load the x values from HBM to shared
 
     // setup registers
-    rt_bf<16, 16> x_r;
-    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_q_r;
-    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_k_r;
+    rt_bf<16, 16> x_r; // 16x16 tile of the x values
+    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_q_r; // 16x16 tile of the W_q values
+    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_k_r; // 16x16 tile of the W_k values
 
-    rt_bf<16, 16> Q_r; // 16x16 tile of the Q block
-    rt_bf<16, 16> K_r; // 16x16 tile of the K block
+    rt_fl<16, 16> Q_r; // 16x16 tile of the Q block
+    rt_fl<16, 16> K_r; // 16x16 tile of the K block
 
-    rv_bf<16> cos_sim; // store the row wise dot products
-    rv_bf<16> q_norm; // store the q row wise norm values
-    rv_bf<16> k_norm; // store the k row wise norm values
-    rv_bf<16> norm; // store the overall norm values
-    rv_bf<16> p; // store the row wise p values
+    cv_bf<16> cos_sim; // store the row wise dot products
+    cv_bf<16> q_norm; // store the q row wise norm values
+    cv_bf<16> k_norm; // store the k row wise norm values
+    cv_bf<16> norm; // store the overall norm values
+    cv_bf<16> p; // store the row wise p values
 
     // zero accumulators
     zero(Q_r);
@@ -98,11 +133,19 @@ void tk_dc(const __grid_constant__ dc_globals g) {
         }
 
         // similarity scores
-        cos_sim = fma_AxBtC::op(Q_r, K_r, cos_sim); // Q_r * K_r + cos_sim 
+        // For cosine similarity (row-wise dot product of Q_r and K_r)
+        rt_bf<16, 16> temp_tile;
+        mul(temp_tile, Q_r, K_r);  // Element-wise multiplication
+        row_sum(cos_sim, temp_tile, cos_sim);  // Sum across columns to get row-wise dot products
 
         // norms
-        q_norm = fma_AxBtC::op(Q_r, Q_r, q_norm); // Q_r * Q_r + q_norm
-        k_norm = fma_AxBtC::op(K_r, K_r, k_norm); // K_r * K_r + k_norm
+        // For Q norms (row-wise dot product of Q_r with itself)
+        mul(temp_tile, Q_r, Q_r);  // Element-wise multiplication (Q_r * Q_r)
+        row_sum(q_norm, temp_tile, q_norm);  // Sum across columns to get row-wise norms squared
+
+        // For K norms (row-wise dot product of K_r with itself)
+        mul(temp_tile, K_r, K_r);  // Element-wise multiplication (K_r * K_r)
+        row_sum(k_norm, temp_tile, k_norm);  // Sum across columns to get row-wise norms squared
 
     }
 
@@ -110,22 +153,24 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     // p_t = 1/2 (1 -(Q_t x K_(t-1)^T) / (||Q_t|| * ||K_(t-1)||) )
     // p = 1/2 (1 - cos_sim / (k_norm * q_norm))
 
-    sqrt(q_norm, q_norm);
-    sqrt(k_norm, k_norm);
+    // Then use it with unary_op for vectors
+    unary_op<sqrt_op>(q_norm, q_norm);  // sqrt(q_norm) -> q_norm
+    unary_op<sqrt_op>(k_norm, k_norm);  // sqrt(k_norm) -> k_norm
     mul(norm, k_norm, q_norm); // k_norm * q_norm
     div(p, cos_sim, norm); // cos_sim / (norm)
-    sub(p, 1, p); // 1 - p
-    mul(p, p, 0.5); // 0.5 * (1 - p)
+    sub(p, p, bf16(1.0f)); // p = p - 1
+    mul(p, p, bf16(-1.0f)); // p = -(p - 1) = 1 - p
+    mul(p, p, bf16(0.5f)); // 0.5 * (1 - p)
 
-    store(p, g.p, {0, 0, byte_id, 0});
+    store(g.p, p, {0, 0, byte_id, 0});
 
     rv_bf<16> b_r; // accumulator for boundary token values
-    geq(b_r, p, bf16(0.5)); // b_r = p >= 0.5
-    store(b_r, g.b, {0, 0, byte_id, 0}); // store the boundary token values
+    unary_op<b_t_op>(b_r, p); // b_r = p >= 0.5
+    store(g.b, b_r, {0, 0, byte_id, 0}); // store the boundary token values
 
     // update the x values
     mul(x_r, x_r, b_r); // x_r = x_r * b_r, broadcasting is handled by TK
-    store(x_r, g.x, {0, 0, byte_id, 0}); // store the updated x values
+    store(g.x, x_r, {0, 0, byte_id, 0}); // store the updated x values
 
 }
 
