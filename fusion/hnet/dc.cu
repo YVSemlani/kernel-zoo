@@ -25,8 +25,8 @@ constexpr int HEAD_DIM = 1024; // d_model = d_k
 // inputs are bfloat16
 
 struct dc_globals {
-    using x_gl = gl<bf16, -1, -1, -1, -1, st_bf<16, HEAD_DIM>>; // 16xHEAD tile (loading 16 bytes per warp)
-    using weights_gl = gl<bf16, -1, -1, -1, -1, st_bf<HEAD_DIM, 16>>; // 16x16 tile corresponding to the input spatial location
+    using x_gl = gl<bf16, -1, -1, -1, -1, st_bf<16, 16>>; // 16x16 tile (loading 16 bytes per warp)
+    using weights_gl = gl<bf16, -1, -1, -1, -1, st_bf<16, 16>>; // 16x16 tile corresponding to the input spatial location
     using p_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 16 element vector of p values corresponding to the 16 bytes of the block
     using b_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 16 element vector of b values
 
@@ -49,14 +49,16 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     // block 1 warp 0 processing bytes 1024-1039
 
     // setup shared memory space for Q and K blocks
+    st_bf<16, 16> (&W_q_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of W_q
+    st_bf<16, 16> (&W_k_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of W_k
 
     // load the x and weights from HBM to shared
     load(g.x, g.x, {0, 0, byte_id, 0});
 
     // setup registers
-    rt_bf<16, HEAD_DIM> x_r;
-    rt_bf<HEAD_DIM, 16, kittens::ducks::rt_layout::col> W_q_r;
-    rt_bf<HEAD_DIM, 16, kittens::ducks::rt_layout::col> W_k_r;
+    rt_bf<16, 16> x_r;
+    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_q_r;
+    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_k_r;
 
     rt_bf<16, 16> Q_r; // 16x16 tile of the Q block
     rt_bf<16, 16> K_r; // 16x16 tile of the K block
@@ -67,23 +69,33 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     rv_bf<16> norm; // store the overall norm values
     rv_bf<16> p; // store the row wise p values
 
+    // zero accumulators
+    zero(Q_r);
+    zero(K_r);
+    zero(cos_sim);
+    zero(q_norm);
+    zero(k_norm);
+    zero(norm);
+    zero(p);
+
     // load x to registers
     load(x_r, g.x, {0, 0, byte_id, 0});
 
     // iterate over the HEAD_DIM dimension in chunks of 16
     for (int i = 0; i < HEAD_DIM; i += 16) {
-        // load the next column of the weights
-        st_bf<HEAD_DIM, 16> (&W_q_s) = al.allocate<st_bf<HEAD_DIM, 16>>(); // allocate memory for a 16x16 tile of W_q
-        load(W_q_s, g.W_q, {0, 0, byte_id, i});
-        load(W_q_r, W_q_s);
+        for (int j = 0; j < SEQ_LEN / 16; j++) {
 
-        st_bf<HEAD_DIM, 16> (&W_k_s) = al.allocate<st_bf<HEAD_DIM, 16>>(); // allocate memory for a 16x16 tile of W_k
-        load(W_k_s, g.W_k, {0, 0, byte_id, i});
-        load(W_k_r, W_k_s);
+            // load weights tiles from HBM to shared to register
+            load(W_q_s, g.W_q, {0, 0, j, byte_id});
+            load(W_q_r, W_q_s);
 
-        // multiply x with the weights
-        mma_AB(Q_r, x_r, W_q_r, Q_r); // Q_r is 16x16 tile of the Q block
-        mma_AB(K_r, x_r, W_k_r, K_r); // K_r is 16x16 tile of the K block
+            load(W_k_s, g.W_k, {0, 0, j, byte_id});
+            load(W_k_r, W_k_s);
+
+            // multiply x with the weights and accumulate to Q_r and K_r
+            mma_AB(Q_r, x_r, W_q_r, Q_r); // Q_r is our 16x16 accumulator which represents a tile of the Q block
+            mma_AB(K_r, x_r, W_k_r, K_r); // K_r is our 16x16 accumulator which represents a tile of the K block
+        }
 
         // similarity scores
         cos_sim = fma_AxBtC::op(Q_r, K_r, cos_sim); // Q_r * K_r + cos_sim 
@@ -116,3 +128,24 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     store(x_r, g.x, {0, 0, byte_id, 0}); // store the updated x values
 
 }
+
+void dispatch_micro(float *d_x, float *d_W_q, float *d_W_k, float *d_p, float *d_b) {
+    using globals = dc_globals;
+
+    // create the global layouts
+    globals::x_gl  x_arg{reinterpret_cast<__nv_bfloat16*>(d_x), 1, BATCH_DIM, SEQ_LEN, HEAD_DIM};
+    globals::weights_gl  W_q_arg{reinterpret_cast<__nv_bfloat16*>(d_W_q), 1, BATCH_DIM, SEQ_LEN, HEAD_DIM};  
+    globals::weights_gl  W_k_arg{reinterpret_cast<__nv_bfloat16*>(d_W_k), 1, BATCH_DIM, SEQ_LEN, HEAD_DIM};
+    globals::p_gl  p_arg{reinterpret_cast<__nv_bfloat16*>(d_p), 1, 1, BATCH_DIM, SEQ_LEN};
+    globals::b_gl  b_arg{reinterpret_cast<__nv_bfloat16*>(d_b), 1, 1, BATCH_DIM, SEQ_LEN};
+
+    globals g{x_arg, W_q_arg, W_k_arg, p_arg, b_arg};
+
+    unsigned long mem_size = 100960; 
+    cudaFuncSetAttribute(tk_dc, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+
+    // Launch 1D grid with correct number of tiles
+    tk_dc<<<NUM_BLOCKS, NUM_THREADS, mem_size>>>(g);
+    cudaDeviceSynchronize();
+}
+#include "harness.impl"
