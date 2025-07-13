@@ -7,6 +7,7 @@
 // blocks handle 16 * NUM_WARPS bytes of the input
 
 // * denotes element wise multiplication
+// accumulators in float to avoid overflows
 
 #include "kittens.cuh"
 using namespace kittens;
@@ -36,39 +37,30 @@ struct dc_globals {
     b_gl b;
 };
 
-// Sqrt operation for bfloat16
+// Sqrt operation following ThunderKittens pattern
 struct sqrt_op {
-    template<typename T> __device__ static inline T op(const T &a) {
-        if constexpr (std::is_same_v<T, bf16>) {
-            // Convert to float, apply sqrt, convert back
-            float f = __bfloat162float(a);
-            return __float2bfloat16(sqrtf(f));
-        } else {
-            return sqrtf(a);
-        }
-    }
+    template<typename T> __device__ static inline T op(const T &a) { return sqrtf(a); }
 };
+template<> __device__ inline float2 sqrt_op::op<float2>(const float2 &a) { 
+    return make_float2(sqrtf(a.x), sqrtf(a.y)); 
+}
+template<> __device__ inline bf16 sqrt_op::op<bf16>(const bf16 &a) { 
+    return __float2bfloat16(sqrtf(__bfloat162float(a))); 
+}
 
-// B_t operation for bfloat16
+// B_t operation following ThunderKittens pattern  
 struct b_t_op {
-    template<typename T> __device__ static inline T op(const T &a) {
-        if constexpr (std::is_same_v<T, bf16>) {
-            // Convert to float, apply b_t, convert back
-            float f = __bfloat162float(a);
-            if (f > 0.5f) {
-                return bf16(1.0f);
-            } else {
-                return bf16(0.0f);
-            }
-        } else {
-            if (a > 0.5f) {
-                return 1.0f;
-            } else {
-                return 0.0f;
-            }
-        }
+    template<typename T> __device__ static inline T op(const T &a) { 
+        return a > 0.5f ? 1.0f : 0.0f; 
     }
 };
+template<> __device__ inline float2 b_t_op::op<float2>(const float2 &a) { 
+    return make_float2(a.x > 0.5f ? 1.0f : 0.0f, a.y > 0.5f ? 1.0f : 0.0f); 
+}
+template<> __device__ inline bf16 b_t_op::op<bf16>(const bf16 &a) { 
+    float f = __bfloat162float(a);
+    return __float2bfloat16(f > 0.5f ? 1.0f : 0.0f); 
+}
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void tk_dc(const __grid_constant__ dc_globals g) {
@@ -95,14 +87,17 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     rt_bf<16, 16, kittens::ducks::rt_layout::col> W_q_r; // 16x16 tile of the W_q values
     rt_bf<16, 16, kittens::ducks::rt_layout::col> W_k_r; // 16x16 tile of the W_k values
 
-    rt_fl<16, 16> Q_r; // 16x16 tile of the Q block
-    rt_fl<16, 16> K_r; // 16x16 tile of the K block
+    rt_fl<16, 16> Q_r; // 16x16 tile of the Q block (float for MMA accumulator)
+    rt_fl<16, 16> K_r; // 16x16 tile of the K block (float for MMA accumulator)
+    //rt_fl<16, 16> Q_r_fl; // 16x16 tile of the Q block
+    //rt_fl<16, 16> K_r_fl; // 16x16 tile of the K block
 
-    cv_bf<16> cos_sim; // store the row wise dot products
-    cv_bf<16> q_norm; // store the q row wise norm values
-    cv_bf<16> k_norm; // store the k row wise norm values
-    cv_bf<16> norm; // store the overall norm values
-    cv_bf<16> p; // store the row wise p values
+    using vec_t = typename decltype(Q_r)::col_vec; // use associated col_vec type for row reductions
+    vec_t cos_sim; // store the row wise dot products (float for accumulation)
+    vec_t q_norm; // store the q row wise norm values (float for accumulation)
+    vec_t k_norm; // store the k row wise norm values (float for accumulation)
+    vec_t norm; // store the overall norm values (float for computation)
+    rv_bf<16> p; // store the row wise p values (can stay bf16 for final result)
 
     // zero accumulators
     zero(Q_r);
@@ -128,24 +123,30 @@ void tk_dc(const __grid_constant__ dc_globals g) {
             load(W_k_r, W_k_s);
 
             // multiply x with the weights and accumulate to Q_r and K_r
-            mma_AB(Q_r, x_r, W_q_r, Q_r); // Q_r is our 16x16 accumulator which represents a tile of the Q block
-            mma_AB(K_r, x_r, W_k_r, K_r); // K_r is our 16x16 accumulator which represents a tile of the K block
+            // mma inputs must be bf16 per thunderkittens
+            mma_AB(Q_r, x_r, W_q_r, Q_r); // X x W_q = Q
+            mma_AB(K_r, x_r, W_k_r, K_r); // X x W_k = K
         }
 
         // similarity scores
         // For cosine similarity (row-wise dot product of Q_r and K_r)
-        rt_bf<16, 16> temp_tile;
-        mul(temp_tile, Q_r, K_r);  // Element-wise multiplication
-        row_sum(cos_sim, temp_tile, cos_sim);  // Sum across columns to get row-wise dot products
+
+        // multiplication inputs must be float per thunderkittens
+        //copy(Q_r_fl, Q_r);
+        //copy(K_r_fl, K_r);
+
+        rt_fl<16, 16> el_wise_mul; // placeholder for all element wise multiplications (float to match Q_r, K_r)
+        mul(el_wise_mul, Q_r, K_r);  // Element-wise multiplication
+        row_sum(cos_sim, el_wise_mul, cos_sim);  // Sum across columns to get row-wise dot products and accumulate to cos_sim
 
         // norms
         // For Q norms (row-wise dot product of Q_r with itself)
-        mul(temp_tile, Q_r, Q_r);  // Element-wise multiplication (Q_r * Q_r)
-        row_sum(q_norm, temp_tile, q_norm);  // Sum across columns to get row-wise norms squared
+        mul(el_wise_mul, Q_r, Q_r);  // Element-wise multiplication (Q_r * Q_r)
+        row_sum(q_norm, el_wise_mul, q_norm);  // Sum across columns to get row-wise norms squared
 
         // For K norms (row-wise dot product of K_r with itself)
-        mul(temp_tile, K_r, K_r);  // Element-wise multiplication (K_r * K_r)
-        row_sum(k_norm, temp_tile, k_norm);  // Sum across columns to get row-wise norms squared
+        mul(el_wise_mul, K_r, K_r);  // Element-wise multiplication (K_r * K_r)
+        row_sum(k_norm, el_wise_mul, k_norm);  // Sum across columns to get row-wise norms squared
 
     }
 
@@ -157,20 +158,24 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     unary_op<sqrt_op>(q_norm, q_norm);  // sqrt(q_norm) -> q_norm
     unary_op<sqrt_op>(k_norm, k_norm);  // sqrt(k_norm) -> k_norm
     mul(norm, k_norm, q_norm); // k_norm * q_norm
-    div(p, cos_sim, norm); // cos_sim / (norm)
-    sub(p, p, bf16(1.0f)); // p = p - 1
-    mul(p, p, bf16(-1.0f)); // p = -(p - 1) = 1 - p
-    mul(p, p, bf16(0.5f)); // 0.5 * (1 - p)
+    
+    vec_t p_fl; // temporary vector for p calculation
+    div(p_fl, cos_sim, norm); // cos_sim / (norm)
+    sub(p_fl, p_fl, 1.0f); // p = p - 1
+    mul(p_fl, p_fl, -1.0f); // p = -(p - 1) = 1 - p
+    mul(p_fl, p_fl, 0.5f); // 0.5 * (1 - p)
+    
+    copy(p, p_fl); // convert from float to bf16 for output
 
     store(g.p, p, {0, 0, byte_id, 0});
 
-    rv_bf<16> b_r; // accumulator for boundary token values
-    unary_op<b_t_op>(b_r, p); // b_r = p >= 0.5
-    store(g.b, b_r, {0, 0, byte_id, 0}); // store the boundary token values
+    // rv_bf<16> b_r; // accumulator for boundary token values
+    // unary_op<b_t_op>(b_r, p); // b_r = p >= 0.5
+    // store(g.b, b_r, {0, 0, byte_id, 0}); // store the boundary token values
 
     // update the x values
-    mul(x_r, x_r, b_r); // x_r = x_r * b_r, broadcasting is handled by TK
-    store(g.x, x_r, {0, 0, byte_id, 0}); // store the updated x values
+    // mul(x_r, x_r, b_r); // x_r = x_r * b_r, broadcasting is handled by TK
+    // store(g.x, x_r, {0, 0, byte_id, 0}); // store the updated x values
 
 }
 
