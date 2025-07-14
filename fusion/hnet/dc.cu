@@ -10,12 +10,14 @@
 // accumulators in float to avoid overflows
 
 #include "kittens.cuh"
+#include "pyutils/pyutils.cuh"
 using namespace kittens;
 
 // dimensions
+// commented out unused vars when running in Python
 
-constexpr int BATCH_DIM = 1;
-constexpr int SEQ_LEN = 128;
+// constexpr int BATCH_DIM = 1;
+constexpr int SEQ_LEN = 8192;
 constexpr int HEAD_DIM = 1024; // d_model = d_k 
 
 // grid dimensions
@@ -25,16 +27,25 @@ constexpr int HEAD_DIM = 1024; // d_model = d_k
 
 // inputs are bfloat16
 
-struct dc_globals {
-    using x_gl = gl<bf16, -1, -1, -1, -1, st_bf<16, 16>>; // 16x16 tile (loading 16 bytes per warp)
-    using weights_gl = gl<bf16, -1, -1, -1, -1, st_bf<16, 16>>; // 16x16 tile corresponding to the input spatial location
-    using p_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 16 element vector of p values corresponding to the 16 bytes of the block
-    using b_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 16 element vector of b values
+// define global layouts
+using x_gl = gl<bf16, -1, -1, -1, -1, st_bf<16, 16>>; // 16x16 tile (loading 16 bytes per warp)
+using weights_gl = gl<bf16, -1, -1, -1, -1, st_bf<16, 16>>; // 16x16 tile corresponding to the input spatial location
+using p_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 16 element vector of p values corresponding to the 16 bytes of the block
+using b_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 16 element vector of b values
 
-    x_gl x;
+struct dc_globals {
+    // input vars
+    x_gl x_q, x_k;
     weights_gl W_q, W_k;
     p_gl p;
     b_gl b;
+
+    // grid - number of thread blocks we are launching
+    dim3 grid() { return dim3(NUM_BLOCKS); }
+    // block - number of threads in a thread block  
+    dim3 block() { return dim3(NUM_THREADS); }
+    // Safe shared memory size for H100
+    size_t dynamic_shared_memory() { return 224000; }
 };
 
 // Sqrt operation following ThunderKittens pattern
@@ -62,6 +73,26 @@ template<> __device__ inline bf16 b_t_op::op<bf16>(const bf16 &a) {
     return __float2bfloat16(f > 0.5f ? 1.0f : 0.0f); 
 }
 
+// Clamp operation: clamps values to [min_val, max_val]
+struct clamp_op {
+    template<typename T> __device__ static inline T op(const T &a) { 
+        return max(min(a, 1.0f), 0.0f); 
+    }
+};
+// Specialize for float2 (vectorized)
+template<> __device__ inline float2 clamp_op::op<float2>(const float2 &a) { 
+    return make_float2(
+        max(min(a.x, 1.0f), 0.0f),
+        max(min(a.y, 1.0f), 0.0f)
+    ); 
+}
+// Specialize for bf16 (if needed, but we're clamping floats)
+template<> __device__ inline bf16 clamp_op::op<bf16>(const bf16 &a) { 
+    float f = __bfloat162float(a);
+    f = max(min(f, 1.0f), 0.0f);
+    return __float2bfloat16(f); 
+}
+
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void tk_dc(const __grid_constant__ dc_globals g) {
 
@@ -77,20 +108,18 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     // setup shared memory space for Q and K blocks
     st_bf<16, 16> (&W_q_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of W_q
     st_bf<16, 16> (&W_k_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of W_k
-    st_bf<16, 16> (&x_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of x
-
-    // load the x and weights from HBM to shared
-    load(x_s, g.x, {0, 0, byte_id, 0}); // load the x values from HBM to shared
+    st_bf<16, 16> (&x_q_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of x
+    st_bf<16, 16> (&x_k_s) = al.allocate<st_bf<16, 16>>(); // allocate memory for a 16x16 tile of x
+    __syncthreads();
 
     // setup registers
-    rt_bf<16, 16> x_r; // 16x16 tile of the x values
-    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_q_r; // 16x16 tile of the W_q values
-    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_k_r; // 16x16 tile of the W_k values
+    rt_bf<16, 16> x_q_r; // 16x16 tile of the x values (seq x d_model chunk)
+    rt_bf<16, 16> x_k_r; // 16x16 tile of the x values (seq x d_model chunk)
+    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_q_r; // 16x16 tile of the W_q values (d_model chunk x d_k chunk)
+    rt_bf<16, 16, kittens::ducks::rt_layout::col> W_k_r; // 16x16 tile of the W_k values (d_model chunk x d_k chunk)
 
-    rt_fl<16, 16> Q_r; // 16x16 tile of the Q block (float for MMA accumulator)
-    rt_fl<16, 16> K_r; // 16x16 tile of the K block (float for MMA accumulator)
-    //rt_fl<16, 16> Q_r_fl; // 16x16 tile of the Q block
-    //rt_fl<16, 16> K_r_fl; // 16x16 tile of the K block
+    rt_fl<16, 16> Q_r; // 16x16 accumulator for Q (seq x d_k chunk)
+    rt_fl<16, 16> K_r; // 16x16 accumulator for K (seq x d_k chunk)
 
     using vec_t = typename decltype(Q_r)::col_vec; // use associated col_vec type for row reductions
     vec_t cos_sim; // store the row wise dot products (float for accumulation)
@@ -98,6 +127,7 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     vec_t k_norm; // store the k row wise norm values (float for accumulation)
     vec_t norm; // store the overall norm values (float for computation)
     rv_bf<16> p; // store the row wise p values (can stay bf16 for final result)
+    __syncthreads();
 
     // zero accumulators
     zero(Q_r);
@@ -108,78 +138,126 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     zero(norm);
     zero(p);
 
-    // load x to registers
-    load(x_r, g.x, {0, 0, byte_id, 0});
+    // Tiled matrix multiplication for Q = x @ W_q and K = x @ W_k
+    // Outer loop over d_k tiles (columns of output)
+    for (int out_col = 0; out_col < HEAD_DIM / 16; out_col++) {
+        // Reset partial accumulators for this output tile
+        zero(Q_r);
+        zero(K_r);
+        __syncthreads();
 
-    // iterate over the HEAD_DIM dimension in chunks of 16
-    for (int i = 0; i < HEAD_DIM; i += 16) {
-        for (int j = 0; j < SEQ_LEN / 16; j++) {
+        // Inner loop over d_model tiles (for contraction)
+        for (int in_col = 0; in_col < HEAD_DIM / 16; in_col++) {
+            // Load x tile: seq tile (byte_id) x d_model chunk (in_col)
+            load(x_q_s, g.x_q, {0, 0, byte_id, in_col});
+            load(x_q_r, x_q_s);
+            load(x_k_s, g.x_k, {0, 0, byte_id, in_col});
+            load(x_k_r, x_k_s);
 
-            // load weights tiles from HBM to shared to register
-            load(W_q_s, g.W_q, {0, 0, j, byte_id});
+            // Load W_q tile: d_model chunk (in_col) x d_k chunk (out_col) - note fixed seq=0 since weights are shared
+            load(W_q_s, g.W_q, {0, 0, in_col, out_col});
             load(W_q_r, W_q_s);
 
-            load(W_k_s, g.W_k, {0, 0, j, byte_id});
+            // Load W_k tile: same as above
+            load(W_k_s, g.W_k, {0, 0, in_col, out_col});
             load(W_k_r, W_k_s);
+            __syncthreads();
 
-            // multiply x with the weights and accumulate to Q_r and K_r
-            // mma inputs must be bf16 per thunderkittens
-            mma_AB(Q_r, x_r, W_q_r, Q_r); // X x W_q = Q
-            mma_AB(K_r, x_r, W_k_r, K_r); // X x W_k = K
+            // Accumulate into Q_r and K_r
+            mma_AB(Q_r, x_q_r, W_q_r, Q_r);
+            mma_AB(K_r, x_k_r, W_k_r, K_r);
+            __syncthreads();
         }
 
-        // similarity scores
-        // For cosine similarity (row-wise dot product of Q_r and K_r)
+        // Now compute partial contributions to cos_sim and norms for this output tile
+        rt_fl<16, 16> el_wise_mul;
+        __syncthreads();
 
-        // multiplication inputs must be float per thunderkittens
-        //copy(Q_r_fl, Q_r);
-        //copy(K_r_fl, K_r);
+        // Cosine sim partial: row_sum(Q_r * K_r)
+        mul(el_wise_mul, Q_r, K_r);
+        row_sum(cos_sim, el_wise_mul, cos_sim);
+        __syncthreads();
 
-        rt_fl<16, 16> el_wise_mul; // placeholder for all element wise multiplications (float to match Q_r, K_r)
-        mul(el_wise_mul, Q_r, K_r);  // Element-wise multiplication
-        row_sum(cos_sim, el_wise_mul, cos_sim);  // Sum across columns to get row-wise dot products and accumulate to cos_sim
+        // Q norm partial: row_sum(Q_r * Q_r)
+        mul(el_wise_mul, Q_r, Q_r);
+        row_sum(q_norm, el_wise_mul, q_norm);
+        __syncthreads();
 
-        // norms
-        // For Q norms (row-wise dot product of Q_r with itself)
-        mul(el_wise_mul, Q_r, Q_r);  // Element-wise multiplication (Q_r * Q_r)
-        row_sum(q_norm, el_wise_mul, q_norm);  // Sum across columns to get row-wise norms squared
-
-        // For K norms (row-wise dot product of K_r with itself)
-        mul(el_wise_mul, K_r, K_r);  // Element-wise multiplication (K_r * K_r)
-        row_sum(k_norm, el_wise_mul, k_norm);  // Sum across columns to get row-wise norms squared
-
+        // K norm partial: row_sum(K_r * K_r)
+        mul(el_wise_mul, K_r, K_r);
+        row_sum(k_norm, el_wise_mul, k_norm);
+        __syncthreads();
     }
 
     // convert to p_t scores
     // p_t = 1/2 (1 -(Q_t x K_(t-1)^T) / (||Q_t|| * ||K_(t-1)||) )
     // p = 1/2 (1 - cos_sim / (k_norm * q_norm))
 
+    // add epsilon to norms to avoid division by zero
+    // add(q_norm, q_norm, 1e-8f);
+    // add(k_norm, k_norm, 1e-8f);
+    // __syncthreads();
+
     // Then use it with unary_op for vectors
     unary_op<sqrt_op>(q_norm, q_norm);  // sqrt(q_norm) -> q_norm
     unary_op<sqrt_op>(k_norm, k_norm);  // sqrt(k_norm) -> k_norm
+    __syncthreads();
+
     mul(norm, k_norm, q_norm); // k_norm * q_norm
-    
+    __syncthreads();
+
     vec_t p_fl; // temporary vector for p calculation
+    add(norm, norm, 1e-12f); // add epsilon to avoid division by zero
+    __syncthreads();
+
     div(p_fl, cos_sim, norm); // cos_sim / (norm)
+    __syncthreads();
+
     sub(p_fl, p_fl, 1.0f); // p = p - 1
+    __syncthreads();
+
     mul(p_fl, p_fl, -1.0f); // p = -(p - 1) = 1 - p
+    __syncthreads();
+
     mul(p_fl, p_fl, 0.5f); // 0.5 * (1 - p)
-    
+    __syncthreads();
+
+    // Clamp p_fl to [0.0f, 1.0f]
+    unary_op<clamp_op>(p_fl, p_fl);
+    __syncthreads();
+
     copy(p, p_fl); // convert from float to bf16 for output
+    __syncthreads();
 
-    store(g.p, p, {0, 0, byte_id, 0});
+    store(g.p, p, {0, 0, 0, byte_id});
+    __syncthreads();
 
-    // rv_bf<16> b_r; // accumulator for boundary token values
-    // unary_op<b_t_op>(b_r, p); // b_r = p >= 0.5
-    // store(g.b, b_r, {0, 0, byte_id, 0}); // store the boundary token values
+    rv_bf<16> b_r; // accumulator for boundary token values
+    unary_op<b_t_op>(b_r, p); // b_r = p >= 0.5
+    store(g.b, b_r, {0, 0, 0, byte_id}); // store the boundary token values
 
     // update the x values
-    // mul(x_r, x_r, b_r); // x_r = x_r * b_r, broadcasting is handled by TK
-    // store(g.x, x_r, {0, 0, byte_id, 0}); // store the updated x values
+    // we can't update the x values at this level b/c we've gone through the entire head dim but only have a 16x16 tile right now
+    // best to do this on the client side
 
 }
 
-void dispatch_micro(float *d_x, float *d_W_q, float *d_W_k, float *d_p, float *d_b) {
+// Launch Kernel
+void dispatch_dc(dc_globals g) {
+    unsigned long mem_size = 50480; 
+    cudaFuncSetAttribute(
+        tk_dc,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        mem_size
+    );
+    tk_dc<<<g.grid(), g.block(), mem_size>>>(g);
+    cudaDeviceSynchronize();
+}
+
+/* OLD DISPATCH FUNCTION */
+
+/* 
+void dispatch_dc(float *d_x, float *d_W_q, float *d_W_k, float *d_p, float *d_b) {
     using globals = dc_globals;
 
     // create the global layouts
@@ -198,4 +276,12 @@ void dispatch_micro(float *d_x, float *d_W_q, float *d_W_k, float *d_p, float *d
     tk_dc<<<NUM_BLOCKS, NUM_THREADS, mem_size>>>(g);
     cudaDeviceSynchronize();
 }
-#include "harness.impl"
+
+*/ 
+PYBIND11_MODULE(tk_dc, m) {
+    m.doc() = "tk_dc python module";
+    // For wrapping kernels directly.
+    kittens::py::bind_kernel<tk_dc, dc_globals>(m, "tk_dc", &dc_globals::x_q, &dc_globals::x_k, &dc_globals::W_q, &dc_globals::W_k, &dc_globals::p, &dc_globals::b);
+    // For host functions that wrap the kernel, this will be called from Python
+    kittens::py::bind_function<dispatch_dc, dc_globals>(m, "dispatch_dc", &dc_globals::x_q, &dc_globals::x_k, &dc_globals::W_q, &dc_globals::W_k, &dc_globals::p, &dc_globals::b);
+}
