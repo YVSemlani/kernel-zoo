@@ -48,9 +48,9 @@ class RoutingModule(nn.Module):
         super().__init__()
         self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
         self.k_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
-        with torch.no_grad():
-            self.q_proj_layer.weight.copy_(torch.eye(d_model))
-            self.k_proj_layer.weight.copy_(torch.eye(d_model))
+        #with torch.no_grad():
+            #self.q_proj_layer.weight.copy_(torch.eye(d_model))
+            #self.k_proj_layer.weight.copy_(torch.eye(d_model))
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
 

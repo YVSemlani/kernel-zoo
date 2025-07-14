@@ -194,9 +194,9 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     // p = 1/2 (1 - cos_sim / (k_norm * q_norm))
 
     // add epsilon to norms to avoid division by zero
-    // add(q_norm, q_norm, 1e-8f);
-    // add(k_norm, k_norm, 1e-8f);
-    // __syncthreads();
+    add(q_norm, q_norm, 1e-12f);
+    add(k_norm, k_norm, 1e-12f);
+    __syncthreads();
 
     // Then use it with unary_op for vectors
     unary_op<sqrt_op>(q_norm, q_norm);  // sqrt(q_norm) -> q_norm
@@ -207,11 +207,12 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     __syncthreads();
 
     vec_t p_fl; // temporary vector for p calculation
-    add(norm, norm, 1e-12f); // add epsilon to avoid division by zero
+    //add(norm, norm, 1e-12f); // add epsilon to avoid division by zero
     __syncthreads();
 
     div(p_fl, cos_sim, norm); // cos_sim / (norm)
     __syncthreads();
+
 
     sub(p_fl, p_fl, 1.0f); // p = p - 1
     __syncthreads();
@@ -222,8 +223,8 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     mul(p_fl, p_fl, 0.5f); // 0.5 * (1 - p)
     __syncthreads();
 
-    // Clamp p_fl to [0.0f, 1.0f]
-    unary_op<clamp_op>(p_fl, p_fl);
+    // clamp p_fl to [0.0f, 1.0f]
+    unary_op<clamp_op>(p_fl, p_fl); // this is what reduces our numerical error
     __syncthreads();
 
     copy(p, p_fl); // convert from float to bf16 for output
