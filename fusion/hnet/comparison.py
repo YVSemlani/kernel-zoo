@@ -58,15 +58,18 @@ if __name__ == "__main__":
     for _ in range(args["num_warmup"]):
         run_native_dc(routing_module, x, mask, **args)
 
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
     # Measure
     native_times = []
     for _ in range(args["num_timing"]):
         torch.cuda.synchronize()
-        start = time.perf_counter()
+        start.record()
         run_native_dc(routing_module, x, mask, **args)
+        end.record()
         torch.cuda.synchronize()
-        end = time.perf_counter()
-        native_times.append(end - start)
+        native_times.append(start.elapsed_time(end))
 
     print(f"Native DC average time: {sum(native_times) / args['num_timing']} seconds\n")
 
@@ -100,11 +103,11 @@ if __name__ == "__main__":
     tk_times = []
     for _ in range(args["num_timing"]):
         torch.cuda.synchronize()
-        start = time.perf_counter()
+        start.record()
         run_tk_dc(x, x_k, W_q, W_k, p, b, **args)
+        end.record()
         torch.cuda.synchronize()
-        end = time.perf_counter()
-        tk_times.append(end - start)
+        tk_times.append(start.elapsed_time(end))
 
     print(f"TK DC average time: {sum(tk_times) / args['num_timing']} seconds\n")
 
