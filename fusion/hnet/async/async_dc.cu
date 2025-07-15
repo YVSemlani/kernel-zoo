@@ -3,50 +3,42 @@
     kernel for the dynamic chunking layer of HNet
 */
 
-// each warp handles 16 bytes of the input
-// blocks handle 16 * NUM_WARPS bytes of the input
-
-// * denotes element wise multiplication
-// accumulators in float to avoid overflows
-
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 using namespace kittens;
 
-// dimensions
-// commented out unused vars when running in Python
-
-// constexpr int BATCH_DIM = 1;
 constexpr int SEQ_LEN = 8192;
-constexpr int HEAD_DIM = 1024; // d_model = d_k 
+constexpr int HEAD_DIM = 1024;
 
-// grid dimensions
-#define NUM_WARPS 8
-#define NUM_THREADS (NUM_WARPS * kittens::WARP_THREADS) // 8 * 32 threads per block
-#define NUM_BLOCKS (SEQ_LEN / (NUM_WARPS * 16)) // 128 blocks @ 8 warps per block -> 512 bytes per block
+// Enable Hopper features
+// #define KITTENS_HOPPER
 
-// inputs are bfloat16
+// Adjust constants for H100
+constexpr int NUM_WARPS = 8; // Match dc.cu for lower pressure
+constexpr int NUM_WARPGROUPS = NUM_WARPS / 4;
+constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+constexpr int NUM_BLOCKS = SEQ_LEN / (NUM_WARPGROUPS * 64);
+
+constexpr int NUM_COLS = HEAD_DIM / 64;
 
 // define global layouts
-using x_gl = gl<bf16, -1, -1, -1, -1, st_bf<16,16>>; // 64x64 tile (loading 64 bytes per warp)
-using weights_gl = gl<bf16, -1, -1, -1, -1, st_bf<16,16>>; // 64x64 tile corresponding to the input spatial location
-using p_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 64 element vector of p values corresponding to the 64 bytes of the block
-using b_gl = gl<bf16, -1, -1, -1, -1, sv_bf<16>>; // 64 element vector of b values
+using x_gl = gl<bf16, -1, -1, -1, -1, st_bf<64, 64>>;
+using weights_gl = gl<bf16, -1, -1, -1, -1, st_bf<64, 64>>;
+using p_gl = gl<bf16, -1, -1, -1, -1, sv_bf<64>>;
+using b_gl = gl<bf16, -1, -1, -1, -1, sv_bf<64>>;
 
 struct dc_globals {
-    // input vars
     x_gl x_q, x_k;
     weights_gl W_q, W_k;
     p_gl p;
     b_gl b;
 
-    // grid - number of thread blocks we are launching
     dim3 grid() { return dim3(NUM_BLOCKS); }
-    // block - number of threads in a thread block  
     dim3 block() { return dim3(NUM_THREADS); }
-    // Safe shared memory size for H100
-    size_t dynamic_shared_memory() { return 8192; }
+    size_t dynamic_shared_memory() { return 100000; } // Lower for H100
 };
+
+/* CUSTOM OPERATIONS */
 
 // Sqrt operation following ThunderKittens pattern
 struct sqrt_op {
@@ -93,120 +85,90 @@ template<> __device__ inline bf16 clamp_op::op<bf16>(const bf16 &a) {
     return __float2bfloat16(f); 
 }
 
-using dbl = double;
-
-struct max_eps_op {
-    template<typename T> __device__ static inline T op(const T &a) { return max(a, 1e-12f); }
-};
-template<> __device__ inline float2 max_eps_op::op<float2>(const float2 &a) { 
-    return make_float2(max(a.x, 1e-12f), max(a.y, 1e-12f)); 
-}
-template<> __device__ inline double max_eps_op::op<double>(const double &a) { return max(a, 1e-12); }
-template<> __device__ inline double2 max_eps_op::op<double2>(const double2 &a) { 
-    return make_double2(max(a.x, 1e-12), max(a.y, 1e-12)); 
-}
-template<> __device__ inline bf16 max_eps_op::op<bf16>(const bf16 &a) { 
-    float f = __bfloat162float(a);
-    f = max(f, 1e-12f);
-    return __float2bfloat16(f); 
-}
-
-template<> __device__ inline double sqrt_op::op<double>(const double &a) { return sqrt(a); }
-template<> __device__ inline double2 sqrt_op::op<double2>(const double2 &a) { 
-    return make_double2(sqrt(a.x), sqrt(a.y)); 
-}
-
-template<> __device__ inline double clamp_op::op<double>(const double &a) { 
-    return max(min(a, 1.0), 0.0); 
-}
-template<> __device__ inline double2 clamp_op::op<double2>(const double2 &a) { 
-    return make_double2(
-        max(min(a.x, 1.0), 0.0),
-        max(min(a.y, 1.0), 0.0)
-    ); 
-}
-
-template<> __device__ inline double b_t_op::op<double>(const double &a) { 
-    return a > 0.5 ? 1.0 : 0.0; 
-}
-template<> __device__ inline double2 b_t_op::op<double2>(const double2 &a) { 
-    return make_double2(a.x > 0.5 ? 1.0 : 0.0, a.y > 0.5 ? 1.0 : 0.0); 
-}
+/* KERNEL */
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void tk_dc(const __grid_constant__ dc_globals g) {
+void async_dc(const __grid_constant__ dc_globals g) {
 
     // setup shared memory
     extern __shared__ alignment_dummy __shm[]; // allocates a dynamic amount of shared memory
     shared_allocator al((int*)&__shm[0]); // create a shared memory allocator and point it to the starting address of the shared memory
 
-    int byte_id = blockIdx.x * NUM_WARPS + kittens::warpid(); // this is the chunk of 16 bytes that we're processing
-    // block 0 warp 0 processing bytes 0-15
-    // block 0 warp 1 processing bytes 16-31
-    // block 1 warp 0 processing bytes 1024-1039
+    using load_group = group<4>; // for asynchronous loading with one warpgroup
 
-    // setup shared memory space for Q and K blocks
-    st_bf<16,16> (&W_q_s) = al.allocate<st_bf<16,16>>(); // allocate memory for a 64x64 tile of W_q
-    st_bf<16,16> (&W_k_s) = al.allocate<st_bf<16,16>>(); // allocate memory for a 64x64 tile of W_k
-    st_bf<16,16> (&x_q_s) = al.allocate<st_bf<16,16>>(); // allocate memory for a 64x64 tile of x
-    st_bf<16,16> (&x_k_s) = al.allocate<st_bf<16,16>>(); // allocate memory for a 64x64 tile of x
-    __syncthreads();
+    int workerid = warpgroup::groupid(); // 0 or 1
+    int byte_id = blockIdx.x * 2 + workerid; // unique byte_id per warpgroup
+
+    // allocate shared memory space for our input tiles
+    st_bf<64, 64> (&x_q_s)[2] = al.allocate<st_bf<64, 64>, 2>(); // one per warpgroup
+    st_bf<64, 64> (&x_k_s)[2] = al.allocate<st_bf<64, 64>, 2>(); // one per warpgroup
+    st_bf<64, 64> (&W_q_s) = al.allocate<st_bf<64, 64>>(); // shared single tile
+    st_bf<64, 64> (&W_k_s) = al.allocate<st_bf<64, 64>>(); // shared single tile
 
     // setup registers
-    rt_bf<16,16> x_q_r; // 64x64 tile of the x values (seq x d_model chunk)
-    rt_bf<16,16> x_k_r; // 64x64 tile of the x values (seq x d_model chunk)
-    rt_bf<16,16, kittens::ducks::rt_layout::col> W_q_r; // 64x64 tile of the W_q values (d_model chunk x d_k chunk)
-    rt_bf<16,16, kittens::ducks::rt_layout::col> W_k_r; // 64x64 tile of the W_k values (d_model chunk x d_k chunk)
+    rt_bf<64, 64> x_q_r; // 64x64 tile of the x values (seq x d_model chunk)
+    rt_bf<64, 64> x_k_r; // 64x64 tile of the x values (seq x d_model chunk)
+    rt_bf<64, 64, kittens::ducks::rt_layout::col> W_q_r; // 64x64 tile of the W_q values (d_model chunk x d_k chunk)
+    rt_bf<64, 64, kittens::ducks::rt_layout::col> W_k_r; // 64x64 tile of the W_k values (d_model chunk x d_k chunk)
 
-    rt_fl<16,16> Q_r;
-    rt_fl<16,16> K_r;
+    rt_fl<64, 64> Q_r; // 64x64 accumulator for Q (seq x d_k chunk)
+    rt_fl<64, 64> K_r; // 64x64 accumulator for K (seq x d_k chunk)
 
     using vec_t = typename decltype(Q_r)::col_vec; // use associated col_vec type for row reductions
     vec_t cos_sim; // store the row wise dot products (float for accumulation)
     vec_t q_norm; // store the q row wise norm values (float for accumulation)
     vec_t k_norm; // store the k row wise norm values (float for accumulation)
     vec_t norm; // store the overall norm values (float for computation)
+    rv_bf<16> p; // store the row wise p values (can stay bf16 for final result)
+
+    // fill in as we go
+
+    // setup semaphores (2 for simplicity)
+    __shared__ kittens::semaphore load_barrier[4];
+    if(threadIdx.x == 0) {
+        for(int i=0; i<2; i++) init_semaphore(load_barrier[i], 0, 1);
+    }
     __syncthreads();
 
-    // zero accumulators
-    zero(cos_sim);
-    zero(q_norm);
-    zero(k_norm);
-    zero(norm);
+    // pipelined outer loop
+    for(int out_col = 0; out_col < NUM_COLS; out_col++) {
+        int tic = out_col % 2;
+        int prev_tic = (out_col + 1) % 2;
 
-    // Tiled matrix multiplication for Q = x @ W_q and K = x @ W_k
-    // Outer loop over d_k tiles (columns of output)
-    for (int out_col = 0; out_col < HEAD_DIM / 16; out_col++) {
-        // Reset partial accumulators for this output tile
-        zero(Q_r);
-        zero(K_r);
-        __syncthreads();
+        // inner loop
+        for(int in_col = 0; in_col < NUM_COLS; in_col++) {
+            // TMA to load W_q and W_k asynchronously which are shared across warpgroups
+            if(workerid == 0) {
+                tma::expect(load_barrier[tic], sizeof(W_q_s));
+                tma::load_async(W_q_s, g.W_q, {0, 0, in_col, out_col}, load_barrier[tic]);
+                tma::load_async(W_k_s, g.W_k, {0, 0, in_col, out_col}, load_barrier[tic]);
+            }
+            wait(load_barrier[tic], 0);
+            __syncthreads();
 
-        // Inner loop over d_model tiles (for contraction)
-        for (int in_col = 0; in_col < HEAD_DIM / 16; in_col++) {
-            // Load x tile: seq tile (byte_id) x d_model chunk (in_col)
-            load(x_q_s, g.x_q, {0, 0, byte_id, in_col});
-            load(x_q_r, x_q_s);
-            load(x_k_s, g.x_k, {0, 0, byte_id, in_col});
-            load(x_k_r, x_k_s);
+            // TMA to load x_q and x_k asynchronously which are per-warpgroup
+            tma::expect(load_barrier[tic], sizeof(x_q_s[0]));
+            tma::load_async(x_q_s[workerid], g.x_q, {0, 0, byte_id, in_col}, load_barrier[tic]);
+            tma::load_async(x_k_s[workerid], g.x_k, {0, 0, byte_id, in_col}, load_barrier[tic]);
+            wait(load_barrier[tic], 0);
+            __syncthreads();
 
-            // Load W_q tile: d_model chunk (in_col) x d_k chunk (out_col) - note fixed seq=0 since weights are shared
-            load(W_q_s, g.W_q, {0, 0, out_col, in_col});
+            // load to register
+            load(x_q_r, x_q_s[workerid]);
+            load(x_k_r, x_k_s[workerid]);
             load(W_q_r, W_q_s);
-
-            // Load W_k tile: same as above
-            load(W_k_s, g.W_k, {0, 0, out_col, in_col});
             load(W_k_r, W_k_s);
             __syncthreads();
 
-            // Accumulate into Q_r and K_r
+            // accumulate into Q_r and K_r using shared
             mma_AB(Q_r, x_q_r, W_q_r, Q_r);
             mma_AB(K_r, x_k_r, W_k_r, K_r);
             __syncthreads();
         }
 
+        // partial operations
         // Now compute partial contributions to cos_sim and norms for this output tile
-        rt_fl<16,16> el_wise_mul;
+        rt_fl<64, 64> el_wise_mul;
         __syncthreads();
 
         // Cosine sim partial: row_sum(Q_r * K_r)
@@ -223,17 +185,21 @@ void tk_dc(const __grid_constant__ dc_globals g) {
         mul(el_wise_mul, K_r, K_r);
         row_sum(k_norm, el_wise_mul, k_norm);
         __syncthreads();
+    
     }
 
-    // convert to p_t scores
+        // convert to p_t scores
     // p_t = 1/2 (1 -(Q_t x K_(t-1)^T) / (||Q_t|| * ||K_(t-1)||) )
     // p = 1/2 (1 - cos_sim / (k_norm * q_norm))
+
+    // add epsilon to norms to avoid division by zero
+    add(q_norm, q_norm, 1e-12f);
+    add(k_norm, k_norm, 1e-12f);
+    __syncthreads();
 
     // Then use it with unary_op for vectors
     unary_op<sqrt_op>(q_norm, q_norm);  // sqrt(q_norm) -> q_norm
     unary_op<sqrt_op>(k_norm, k_norm);  // sqrt(k_norm) -> k_norm
-    unary_op<max_eps_op>(q_norm, q_norm);
-    unary_op<max_eps_op>(k_norm, k_norm);
     __syncthreads();
 
     mul(norm, k_norm, q_norm); // k_norm * q_norm
@@ -245,7 +211,6 @@ void tk_dc(const __grid_constant__ dc_globals g) {
 
     div(p_fl, cos_sim, norm); // cos_sim / (norm)
     __syncthreads();
-
 
     sub(p_fl, p_fl, 1.0f); // p = p - 1
     __syncthreads();
@@ -260,28 +225,24 @@ void tk_dc(const __grid_constant__ dc_globals g) {
     unary_op<clamp_op>(p_fl, p_fl); // this is what reduces our numerical error
     __syncthreads();
 
-    store(g.p, p_fl, {0, 0, 0, byte_id});
+    store(g.p, p_fl, {0, 0, 0, byte_id}); // need to fix cross warp stores for p and b
     __syncthreads();
 
     vec_t b_r; // accumulator for boundary token values
     unary_op<b_t_op>(b_r, p_fl); // b_r = p >= 0.5
     store(g.b, b_r, {0, 0, 0, byte_id}); // store the boundary token values
 
-    // update the x values
-    // we can't update the x values at this level b/c we've gone through the entire head dim but only have a 16x16 tile right now
-    // best to do this on the client side
-
 }
 
 // Launch Kernel
 void dispatch_dc(dc_globals g) {
-    unsigned long mem_size = 8192; 
+    unsigned long mem_size = 50480; 
     cudaFuncSetAttribute(
-        tk_dc,
+        async_dc,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         mem_size
     );
-    tk_dc<<<g.grid(), g.block(), mem_size>>>(g);
+    async_dc<<<g.grid(), g.block(), mem_size>>>(g);
     cudaDeviceSynchronize();
 }
 
@@ -309,10 +270,10 @@ void dispatch_dc(float *d_x, float *d_W_q, float *d_W_k, float *d_p, float *d_b)
 }
 
 */ 
-PYBIND11_MODULE(tk_dc, m) {
-    m.doc() = "tk_dc python module";
+PYBIND11_MODULE(async_dc, m) {
+    m.doc() = "async_dc python module";
     // For wrapping kernels directly.
-    kittens::py::bind_kernel<tk_dc, dc_globals>(m, "tk_dc", &dc_globals::x_q, &dc_globals::x_k, &dc_globals::W_q, &dc_globals::W_k, &dc_globals::p, &dc_globals::b);
+    kittens::py::bind_kernel<async_dc, dc_globals>(m, "async_dc", &dc_globals::x_q, &dc_globals::x_k, &dc_globals::W_q, &dc_globals::W_k, &dc_globals::p, &dc_globals::b);
     // For host functions that wrap the kernel, this will be called from Python
     kittens::py::bind_function<dispatch_dc, dc_globals>(m, "dispatch_dc", &dc_globals::x_q, &dc_globals::x_k, &dc_globals::W_q, &dc_globals::W_k, &dc_globals::p, &dc_globals::b);
 }
