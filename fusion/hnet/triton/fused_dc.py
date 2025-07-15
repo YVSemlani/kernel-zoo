@@ -2,8 +2,9 @@ import torch
 
 import triton
 import triton.language as tl
+from triton.runtime import driver
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+DEVICE = driver.active.get_active_torch_device()
 
 """
 
@@ -12,13 +13,21 @@ Fused dynamic chunking kernel based off Triton's fused softmax tutorial
 
 """
 
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+def is_cdna():
+    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942',
+                                                                                   'gfx90a', 'gfx908')
+
 @triton.jit
 def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
             K_ptr, # B x (L - 1) x D
             p_ptr, # B x L - 1
-            b_ptr # B x L - 1
+            b_ptr, # B x L - 1
             Q_row_stride,
-            K_stride,
+            K_row_stride,
             p_stride, # most likely 1
             b_stride, # most likely 1
             # batch_dim, # add back when we use over multiple batches
@@ -28,47 +37,60 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
             num_stages: tl.constexpr
             ):
 
-row_start = tl.program_id(0) # assume singular batch dim for now
-row_step = tl.num_programs(0)
+    row_start = tl.program_id(0) # assume singular batch dim for now
+    row_step = tl.num_programs(0)
 
-# instead of load row -> make unit vector -> back to global memory -> load normed row -> dot prod -> back to global memory -> get probabilities -> get boundaries
-# we want load row -> make unit vector -> dot prod -> get probabilities -> get boundaries -> back to global memory -> load clientside
+    # instead of load row -> make unit vector -> back to global memory -> load normed row -> dot prod -> back to global memory -> get probabilities -> get boundaries
+    # we want load row -> make unit vector -> dot prod -> get probabilities -> get boundaries -> back to global memory -> load clientside
 
-for row_start_idx in tl.range(row_start, seq_len, row_step, num_stages=num_stages):
-    Q_row_start_ptr = Q_ptr + row_idx * Q_row_stride
-    K_row_start_ptr = K_ptr + row_idx * K_row_stride
+    for row_start_idx in tl.range(row_start, seq_len, row_step, num_stages=num_stages):
+        Q_row_start_ptr = Q_ptr + row_start * Q_row_stride
+        K_row_start_ptr = K_ptr + row_start * K_row_stride
 
-    col_offsets = tl.arange(0, BLOCK_SIZE)
+        col_offsets = tl.arange(0, BLOCK_SIZE)
 
-    Q_input_ptrs = Q_row_start_ptr + col_offsets
-    K_input_ptrs = K_row_start_ptr + col_offsets
+        Q_input_ptrs = Q_row_start_ptr + col_offsets
+        K_input_ptrs = K_row_start_ptr + col_offsets
 
-    mask = col_offsets < head_dim
+        mask = col_offsets < head_dim
 
-    Q_row = tl.load(Q_input_ptrs, mask=mask, other=float(0))
-    K_row = tl.load(K_input_ptrs, mask=mask, other=float(0))
+        Q_row = tl.load(Q_input_ptrs, mask=mask, other=float(0))
+        K_row = tl.load(K_input_ptrs, mask=mask, other=float(0))
 
-    # operations
+        tl.static_print(Q_row)
+        tl.static_print(K_row)
 
-    Q_norm = tl.sqrt(tl.sum(Q_row * Q_row, axis=0)) # ||Q||
-    K_norm = tl.sqrt(tl.sum(K_row * K_row, axis=0)) # ||K||
+        # operations
 
-    ele_dot = Q_row * K_row
-    norms = Q_norm * K_norm
+        Q_norm = tl.sqrt(tl.sum(Q_row * Q_row, axis=0)) # ||Q||
+        K_norm = tl.sqrt(tl.sum(K_row * K_row, axis=0)) # ||K||
 
-    cos_sim = ele_dot / norms
+        tl.static_print(Q_norm)
+        tl.static_print(K_norm)
 
-    p = tl.clamp((1 - cos_sim) / 2, 0, 1) # clamp should no-op unless we have precision errors
+        ele_dot = tl.sum(Q_row * K_row, axis=0)
+        norms = Q_norm * K_norm
 
-    b = tl.where(x >= 0.5, 1, 0) # piecewise boundary function applied
+        tl.static_print(ele_dot)
+        tl.static_print(norms)
 
-    # store
+        cos_sim = ele_dot / norms
 
-    p_out_ptr = p_ptr + row_idx * p_stride # 1-D tensor so our stride to next row is just the next memory address
-    b_out_ptr = b_ptr + row_idx * b_stride
+        p = tl.clamp((1 - cos_sim) / 2, 0, 1) # clamp should no-op unless we have precision errors
 
-    tl.store(p_out_ptr, p, mask=mask)
-    tl.store(b_out_ptr, b, mask=mask)
+        b = tl.where(p >= 0.5, 1, 0) # piecewise boundary function applied
+
+        tl.static_print(p)
+        tl.static_print(b)
+
+        # store
+
+        p_out_ptr = p_ptr + row_start * p_stride # 1-D tensor so our stride to next row is just the next memory address
+        b_out_ptr = b_ptr + row_start * b_stride
+
+
+        tl.store(p_out_ptr, p) # no mask needed because we generate a single value
+        tl.store(b_out_ptr, b)
 
 properties = driver.active.utils.get_device_properties(DEVICE.index)
 NUM_SM = properties["multiprocessor_count"]
@@ -83,17 +105,20 @@ def fused_dc(Q, K):
     assert Q.shape == K.shape, "Q and K must have the same shape"
 
     seq_len, head_dim = Q.shape
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    BLOCK_SIZE = triton.next_power_of_2(head_dim)
 
     num_warps = 8 # this can be autotuned
 
     num_stages = 4 if SIZE_SMEM > 200000 else 2
 
-    p = torch.empty((seq_len))
+    p = torch.empty((seq_len), device=DEVICE)
     b = torch.empty_like(p)
 
+    print(p.shape)
+    print(b.shape)
+
     # pre-compile kernel to get register usage and compute thread occupancy.
-    kernel = fused_dc_kernel.warmup(Q, K, p, b Q.stride(0), K.stride(0), p.stride(0), b.stride(0), seq_len, head_dim, BLOCK_SIZE=BLOCK_SIZE,
+    kernel = fused_dc_kernel.warmup(Q, K, p, b, Q.stride(0), K.stride(0), p.stride(0), b.stride(0), seq_len, head_dim, BLOCK_SIZE=BLOCK_SIZE,
                                    num_stages=num_stages, num_warps=num_warps, grid=(1, ))
 
     kernel._init_handles()
@@ -125,8 +150,23 @@ def fused_dc(Q, K):
     num_programs = min(num_programs, seq_len)
 
     # Create a number of persistent programs.
-    kernel[(num_programs, 1, 1)](Q, K, p, b, Q.stride(0), K.stride(0) p.stride(0), b.stride(0), seq_len, head_dim, BLOCK_SIZE, num_stages)
+    kernel[(num_programs, 1, 1)](Q, K, p, b, Q.stride(0), K.stride(0), p.stride(0), b.stride(0), seq_len, head_dim, BLOCK_SIZE, num_stages)
     return p, b
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    Q = torch.randn(1823, 255, device=DEVICE)
+    K = torch.randn(1823, 255, device=DEVICE)
+
+    p_triton, b_triton = fused_dc(Q, K)
+
+    # detach
+    p = p_triton.detach().cpu()
+    b = b_triton.detach().cpu()
+
+    print(p)
+
+    print(b)
 
 
 
