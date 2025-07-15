@@ -33,8 +33,8 @@ def setup(args):
     routing_module.to("cuda")
 
     # get weights from routing module
-    W_q = routing_module.q_proj_layer.weight
-    W_k = routing_module.k_proj_layer.weight
+    W_q = routing_module.q_proj_layer.weight.T.contiguous()
+    W_k = routing_module.k_proj_layer.weight.T.contiguous()
 
     return x, mask, p, b, W_q, W_k, routing_module
 
@@ -86,9 +86,19 @@ if __name__ == "__main__":
     #W_k = W_k.to(torch.bfloat16)
 
     # we want to shift x_k to the right and zero the initial token
+    x_q = x.clone()
     x_k = x.clone()
-    x_k[:, :, 0, :] = torch.zeros_like(x_k[:, :, 0, :])
-    x_k[:, :, 1:, :] = x[:, :, :-1, :]
+
+    x_k = x_k[:, :, :-1, :]
+    x_q = x_q[:, :, 1:, :]
+
+    # add padding to the end of both x_q and x_k
+    x_q = F.pad(x_q, (0, 0, 1, 0), "constant", 0)
+    x_k = F.pad(x_k, (0, 0, 1, 0), "constant", 0)
+
+    print("FLAGGG")
+    print(x_q[0, 0, 0, :])
+    print(x_k[0, 0, 0, :])
 
     # run tk dc
     p, b = run_tk_dc(x, x_k, W_q, W_k, p, b, **args)
