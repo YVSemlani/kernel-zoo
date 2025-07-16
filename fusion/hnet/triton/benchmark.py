@@ -10,6 +10,8 @@ import torch.nn.functional as F
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+RUN_NAME = "Short-Sequence"
+
 def run_dc(x, mask, routing_module):
     return routing_module(x, mask=mask)
 
@@ -36,7 +38,7 @@ def run_fused_dc(x, q_proj, k_proj):
         ],  # label name for the lines
         styles=[('blue', '-'), ('green', '-')],  # line styles
         ylabel="time (ms)",  # label name for the y-axis
-        plot_name="fused_dc-performance",  # name for the plot. Used also as a file name for saving the plot.
+        plot_name=RUN_NAME,  # name for the plot. Used also as a file name for saving the plot.
         args={'HEAD_DIM': 1024},  # values for function arguments not in `x_names` and `y_name`
     ))
 def benchmark(SEQ_LEN, HEAD_DIM, provider):
@@ -57,4 +59,4 @@ def benchmark(SEQ_LEN, HEAD_DIM, provider):
     return ms
 
 
-benchmark.run(show_plots=True, print_data=True)
+benchmark.run(show_plots=True, print_data=True, save_path="benchmarks")
