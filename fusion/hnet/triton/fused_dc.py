@@ -57,22 +57,22 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
         Q_row = tl.load(Q_input_ptrs, mask=mask, other=float(0))
         K_row = tl.load(K_input_ptrs, mask=mask, other=float(0))
 
-        tl.static_print(Q_row)
-        tl.static_print(K_row)
+        #tl.static_print(Q_row)
+        #tl.static_print(K_row)
 
         # operations
 
         Q_norm = tl.sqrt(tl.sum(Q_row * Q_row, axis=0)) # ||Q||
         K_norm = tl.sqrt(tl.sum(K_row * K_row, axis=0)) # ||K||
 
-        tl.static_print(Q_norm)
-        tl.static_print(K_norm)
+        #tl.static_print(Q_norm)
+        #tl.static_print(K_norm)
 
         ele_dot = tl.sum(Q_row * K_row, axis=0)
         norms = Q_norm * K_norm
 
-        tl.static_print(ele_dot)
-        tl.static_print(norms)
+        #tl.static_print(ele_dot)
+        #tl.static_print(norms)
 
         cos_sim = ele_dot / norms
 
@@ -80,8 +80,8 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
 
         b = tl.where(p >= 0.5, 1, 0) # piecewise boundary function applied
 
-        tl.static_print(p)
-        tl.static_print(b)
+        #tl.static_print(p)
+        #tl.static_print(b)
 
         # store
 
@@ -114,8 +114,8 @@ def fused_dc(Q, K):
     p = torch.empty((seq_len), device=DEVICE)
     b = torch.empty_like(p)
 
-    print(p.shape)
-    print(b.shape)
+    #print(p.shape)
+    #print(b.shape)
 
     # pre-compile kernel to get register usage and compute thread occupancy.
     kernel = fused_dc_kernel.warmup(Q, K, p, b, Q.stride(0), K.stride(0), p.stride(0), b.stride(0), seq_len, head_dim, BLOCK_SIZE=BLOCK_SIZE,
