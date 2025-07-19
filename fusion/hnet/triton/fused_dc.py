@@ -15,39 +15,14 @@ Fused dynamic chunking kernel based off Triton's fused softmax tutorial
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5,
-                      num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5,
-                      num_warps=2),
-        # Good config for fp8 inputs.
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4)
+        triton.Config({}, num_stages=2, num_warps=16),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=4),
+        triton.Config({}, num_stages=5, num_warps=2),
+        triton.Config({}, num_stages=6, num_warps=4),
+        triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=8),
+        triton.Config({}, num_stages=5, num_warps=4)
     ]
 
 def is_hip():
@@ -58,31 +33,51 @@ def is_cdna():
     return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942',
                                                                                    'gfx90a', 'gfx908')
 
+@triton.autotune(
+    configs=get_cuda_autotune_config(),
+    key=['batch_dim', 'seq_len', 'head_dim']
+)
 @triton.jit
 def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
             K_ptr, # B x (L - 1) x D
             p_ptr, # B x L - 1
             b_ptr, # B x L - 1
+            Q_batch_stride,
+            K_batch_stride,
+            p_batch_stride,
+            b_batch_stride,
             Q_row_stride,
             K_row_stride,
             p_stride, # most likely 1
             b_stride, # most likely 1
-            # batch_dim, # add back when we use over multiple batches
+            batch_dim, # add back when we use over multiple batches
             seq_len,
             head_dim,
             BLOCK_SIZE: tl.constexpr,
             num_stages: tl.constexpr
             ):
 
-    row_start = tl.program_id(0) # assume singular batch dim for now
-    row_step = tl.num_programs(0)
+    batch_start = tl.program_id(0) # grid x axis handles a single sequence in the batch
+    row_start = tl.program_id(1) # assume singular batch dim for now
+    row_step = tl.num_programs(1) # grid y axis handles an entire sequence in the batch
+
+    # get starting pointer for this element in the batch
+    Q_batch_ptr = Q_ptr + batch_start * Q_batch_stride
+    K_batch_ptr = K_ptr + batch_start * K_batch_stride
+    p_batch_ptr = p_ptr + batch_start * p_batch_stride
+    b_batch_ptr = b_ptr + batch_start * b_batch_stride
+
+    # BOS token set as mandatory boundary for each sequence in the batch
+    if row_start == 0:
+        tl.store(p_batch_ptr, 1.0)       
+        tl.store(b_batch_ptr, 1)         
 
     # instead of load row -> make unit vector -> back to global memory -> load normed row -> dot prod -> back to global memory -> get probabilities -> get boundaries
     # we want load row -> make unit vector -> dot prod -> get probabilities -> get boundaries -> back to global memory -> load clientside
 
     for row_start_idx in tl.range(row_start, seq_len, row_step, num_stages=num_stages):
-        Q_row_start_ptr = Q_ptr + row_start_idx * Q_row_stride
-        K_row_start_ptr = K_ptr + row_start_idx * K_row_stride
+        Q_row_start_ptr = Q_batch_ptr + row_start_idx * Q_row_stride
+        K_row_start_ptr = K_batch_ptr + row_start_idx * K_row_stride
 
         col_offsets = tl.arange(0, BLOCK_SIZE)
 
@@ -94,22 +89,13 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
         Q_row = tl.load(Q_input_ptrs, mask=mask, other=float(0))
         K_row = tl.load(K_input_ptrs, mask=mask, other=float(0))
 
-        #tl.static_print(Q_row)
-        #tl.static_print(K_row)
-
         # operations
 
         Q_norm = tl.sqrt(tl.sum(Q_row * Q_row, axis=0)) # ||Q||
         K_norm = tl.sqrt(tl.sum(K_row * K_row, axis=0)) # ||K||
 
-        #tl.static_print(Q_norm)
-        #tl.static_print(K_norm)
-
-        ele_dot = tl.sum(Q_row * K_row, axis=0)
+        ele_dot = tl.sum(Q_row * K_row)
         norms = Q_norm * K_norm
-
-        #tl.static_print(ele_dot)
-        #tl.static_print(norms)
 
         cos_sim = ele_dot / norms
 
@@ -117,17 +103,15 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
 
         b = tl.where(p >= 0.5, 1, 0) # piecewise boundary function applied
 
-        #tl.static_print(p)
-        #tl.static_print(b)
-
         # store
 
-        p_out_ptr = p_ptr + row_start_idx * p_stride # 1-D tensor so our stride to next row is just the next memory address
-        b_out_ptr = b_ptr + row_start_idx * b_stride
+        p_out_ptr = p_batch_ptr + row_start_idx * p_stride + 1 # 1-D tensor so our stride to next row is just the next memory address
+        b_out_ptr = b_batch_ptr + row_start_idx * b_stride + 1
 
 
         tl.store(p_out_ptr, p) # no mask needed because we generate a single value
         tl.store(b_out_ptr, b)
+        
 
 properties = driver.active.utils.get_device_properties(DEVICE.index)
 NUM_SM = properties["multiprocessor_count"]
@@ -140,60 +124,22 @@ kernels = {}
 # we're ignoring batch length right now
 def fused_dc(Q, K):
     assert Q.shape == K.shape, "Q and K must have the same shape"
+    assert Q.dim() == 3, "Q and K must be 3D tensors"
 
-    seq_len, head_dim = Q.shape
+    batch_size, seq_len, head_dim = Q.shape
     BLOCK_SIZE = triton.next_power_of_2(head_dim)
 
-    num_warps = 8 # this can be autotuned
-
-    num_stages = 4 if SIZE_SMEM > 200000 else 2
-
-    p = torch.empty((seq_len), device=DEVICE)
+    p = torch.empty((batch_size, seq_len + 1), device=DEVICE)
     b = torch.empty_like(p)
 
-    #print(p.shape)
-    #print(b.shape)
-
-    # pre-compile kernel to get register usage and compute thread occupancy.
-    kernel = fused_dc_kernel.warmup(Q, K, p, b, Q.stride(0), K.stride(0), p.stride(0), b.stride(0), seq_len, head_dim, BLOCK_SIZE=BLOCK_SIZE,
-                                   num_stages=num_stages, num_warps=num_warps, grid=(1, ))
-
-    kernel._init_handles()
-    n_regs = kernel.n_regs
-    size_smem = kernel.metadata.shared
-    if is_hip():
-        # NUM_REGS represents the number of regular purpose registers. On CDNA architectures this is half of all registers available.
-        # However, this is not always the case. In most cases all registers can be used as regular purpose registers.
-        # ISA SECTION (3.6.4 for CDNA3)
-        # VGPRs are allocated out of two pools: regular VGPRs and accumulation VGPRs. Accumulation VGPRs are used
-        # with matrix VALU instructions, and can also be loaded directly from memory. A wave may have up to 512 total
-        # VGPRs, 256 of each type. When a wave has fewer than 512 total VGPRs, the number of each type is flexible - it is
-        # not required to be equal numbers of both types.
-        NUM_GPRS = NUM_REGS
-        if is_cdna():
-            NUM_GPRS = NUM_REGS * 2
-
-        # MAX_NUM_THREADS represents maximum number of resident threads per multi-processor.
-        # When we divide this number with WARP_SIZE we get maximum number of waves that can
-        # execute on a CU (multi-processor)  in parallel.
-        MAX_NUM_THREADS = properties["max_threads_per_sm"]
-        max_num_waves = MAX_NUM_THREADS // WARP_SIZE
-        occupancy = min(NUM_GPRS // WARP_SIZE // n_regs, max_num_waves) // num_warps
-    else:
-        occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
-    occupancy = min(occupancy, SIZE_SMEM // size_smem)
-    num_programs = NUM_SM * occupancy
-
-    num_programs = min(num_programs, seq_len)
-
     # Create a number of persistent programs.
-    kernel[(num_programs, 1, 1)](Q, K, p, b, Q.stride(0), K.stride(0), p.stride(0), b.stride(0), seq_len, head_dim, BLOCK_SIZE, num_stages)
+    fused_dc_kernel[(batch_size, seq_len, 1)](Q, K, p, b, Q.stride(0), K.stride(0), p.stride(0), b.stride(0), Q.stride(1), K.stride(1), p.stride(1), b.stride(1), batch_size, seq_len, head_dim, BLOCK_SIZE)
     return p, b
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    Q = torch.randn(1823, 255, device=DEVICE)
-    K = torch.randn(1823, 255, device=DEVICE)
+    Q = torch.randn(4, 8192, 1024, device=DEVICE)
+    K = torch.randn(4, 8192, 1024, device=DEVICE)
 
     p_triton, b_triton = fused_dc(Q, K)
 
