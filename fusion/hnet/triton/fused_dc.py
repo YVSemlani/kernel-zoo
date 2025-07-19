@@ -44,8 +44,8 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
     # we want load row -> make unit vector -> dot prod -> get probabilities -> get boundaries -> back to global memory -> load clientside
 
     for row_start_idx in tl.range(row_start, seq_len, row_step, num_stages=num_stages):
-        Q_row_start_ptr = Q_ptr + row_start * Q_row_stride
-        K_row_start_ptr = K_ptr + row_start * K_row_stride
+        Q_row_start_ptr = Q_ptr + row_start_idx * Q_row_stride
+        K_row_start_ptr = K_ptr + row_start_idx * K_row_stride
 
         col_offsets = tl.arange(0, BLOCK_SIZE)
 
@@ -85,8 +85,8 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
 
         # store
 
-        p_out_ptr = p_ptr + row_start * p_stride # 1-D tensor so our stride to next row is just the next memory address
-        b_out_ptr = b_ptr + row_start * b_stride
+        p_out_ptr = p_ptr + row_start_idx * p_stride # 1-D tensor so our stride to next row is just the next memory address
+        b_out_ptr = b_ptr + row_start_idx * b_stride
 
 
         tl.store(p_out_ptr, p) # no mask needed because we generate a single value
