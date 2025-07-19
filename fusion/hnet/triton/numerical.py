@@ -28,8 +28,8 @@ def run_fused(x, routing_module):
 if __name__ == "__main__":
     routing_module = RoutingModule(d_model=1024, device=torch.device("cuda"))
 
-    x = torch.randn(1, 1024, 1024, device=torch.device("cuda"))
-    mask = torch.ones(1, 1024, device=torch.device("cuda"), dtype=torch.bool)
+    x = torch.randn(1, 8192 * 10, 1024, device=torch.device("cuda"))
+    mask = torch.ones(1, 8192 * 10, device=torch.device("cuda"), dtype=torch.bool)
 
     routing_module_output = routing_module(x, mask=mask)
     boundary_prob, boundary_mask, selected_probs = routing_module_output.boundary_prob, routing_module_output.boundary_mask, routing_module_output.selected_probs

@@ -29,7 +29,7 @@ def run_fused_dc(x, q_proj, k_proj):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['SEQ_LEN'],  # argument names to use as an x-axis for the plot
-        x_vals=[2 ** i for i in range(2, 11)],  # different possible values for `x_name`
+        x_vals=[2 ** i for i in range(2, 14)],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=['triton', 'torch'],  # possible values for `line_arg``
         line_names=[
