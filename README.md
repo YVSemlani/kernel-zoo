@@ -13,4 +13,17 @@ kernel-zoo/
 │       └── torch/                      # PyTorch implementations
 └── 🔧 utils/                           # Shared utilities
 ```
+## Development
+
+I've currently implemented these kernels:
+
+- HNet Fused Dynamic Chunking (most recent code available in my [hnet repo](https://github.com/YVSemlani/hnet))
+- Attention
+- Vector Addition
+- 2D Convolution
+
+
+
+
+
 
